@@ -940,7 +940,8 @@ async def main():
     else:
         S["tg"] = "login_needed"
         log("Telegram login needed: open the dashboard and log in", "warn")
-    await client.run_until_disconnected()
+    while True:                                   # stay alive; Telethon delivers updates in the background
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
