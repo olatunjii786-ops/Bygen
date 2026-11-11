@@ -47,7 +47,10 @@ ENV_SESSION = bool(os.environ.get("TG_SESSION"))
 SITE_EMAIL, SITE_PASSWORD = need("SITE_EMAIL"), need("SITE_PASSWORD")
 UI_PASSWORD = need("UI_PASSWORD")
 E = os.environ
-TZ = ZoneInfo(E.get("TZ_NAME", "Africa/Lagos"))
+try:
+    TZ = ZoneInfo(E.get("TZ_NAME", "Africa/Lagos"))
+except Exception:                                      # tz database missing: Lagos is fixed UTC+1
+    TZ = timezone(timedelta(hours=1))
 DRY_RUN = E.get("DRY_RUN", "1") == "1"
 MAX_STAKE = float(E.get("MAX_STAKE", "0"))            # 0 = full balance
 MIN_STAKE = 1000.0
