@@ -55,6 +55,8 @@ DRY_RUN = E.get("DRY_RUN", "1") == "1"
 MAX_STAKE = float(E.get("MAX_STAKE", "0"))            # 0 = full balance
 MIN_STAKE = 1000.0
 STOP_LOSS_PCT = float(E.get("STOP_LOSS_PCT", "3"))
+STOP_VALUE = float(E.get("STOP_VALUE", "0"))          # >0: sell only when the position is worth this much (₦)
+SETTINGS_FILE = "/tmp/settings.json"
 POLL = float(E.get("POLL_SECONDS", "2"))
 DAY_OFFSETS = {int(x) for x in E.get("ALLOWED_DAY_OFFSETS", "0").split(",")}
 CATCHUP_MIN = int(E.get("CATCHUP_MINUTES", "20"))     # after a restart, still act on calls this recent
@@ -66,6 +68,18 @@ USED_FILE = "/tmp/used_orders.json"
 # ------------------------------------------------------------------ shared state (shown in the UI)
 S = {"status": "starting", "paused": False, "busy": False, "trade": None, "live": None,
      "started": time.time(), "tg": "connecting", "tg_err": "", "tg_session": None, "channel": None}
+try:                                                      # dashboard value survives soft restarts
+    S["stop_value"] = float(json.load(open(SETTINGS_FILE))["stop_value"])
+except Exception:
+    S["stop_value"] = STOP_VALUE
+S["qty"] = 0
+
+
+def stop_label():
+    v = S["stop_value"]
+    return f"when position worth ₦{v:.0f}" if v else f"-{STOP_LOSS_PCT}%"
+
+
 TG = {}
 CHAN = None
 tg_ready = asyncio.Event()
@@ -401,7 +415,7 @@ async def process_call(order_id):
         finish(run)
         S["trade"] = {"symbol": h["symbol"], "entry": ctxd["price"], "stake": ctxd["stake"],
                       "opened": now_s(), "baseline": False}
-        await notify(f"BOUGHT {h['symbol']}: ₦{ctxd['stake']} at ₦{ctxd['price']}. Stop-loss -{STOP_LOSS_PCT}%.")
+        await notify(f"BOUGHT {h['symbol']}: ₦{ctxd['stake']} at ₦{ctxd['price']}. Stop-loss {stop_label()}.")
         await manage(h)
     except Exception as e:
         run["status"] = "failed"
@@ -437,10 +451,11 @@ async def manage(h):
     await do(run, "Record entry price", s_base)
 
     async def watch(st):
-        floor = t["entry"] * (1 - STOP_LOSS_PCT / 100)
-        S["live"] = {"price": None, "floor": floor, "updated": None, "changed": time.time()}
+        qty = h["avail"] + h["locked"]
+        S["qty"] = qty
+        mode = {"v": None, "floor": None}
+        S["live"] = {"price": None, "floor": None, "updated": None, "changed": time.time()}
         last, closed, errs = None, 0, 0
-        st.note(f"stop-loss at ₦{floor:.2f}")
         while True:
             if force.is_set():
                 return "manual"
@@ -452,13 +467,26 @@ async def manage(h):
                 if price != last:
                     L["changed"], last = time.time(), price
                 errs = 0
+                v = S["stop_value"]
+                if mode["v"] is None or mode["v"] != v:          # decide again whenever you change it
+                    if v and qty > 0 and qty * price > v:
+                        mode.update(v=v, floor=v / qty)
+                        st.note(f"sells if position falls to ₦{v:.0f} (price ₦{v / qty:.2f})")
+                    else:
+                        mode.update(v=v, floor=t["entry"] * (1 - STOP_LOSS_PCT / 100))
+                        st.note(f"sells at -{STOP_LOSS_PCT}% (price ₦{mode['floor']:.2f})")
+                        if v:
+                            await notify(f"Stop value ₦{v:.0f} is not below this position's worth "
+                                         f"(₦{qty * price:.0f}), so -{STOP_LOSS_PCT}% is used instead. "
+                                         f"Lower it on the dashboard.")
+                L["floor"] = mode["floor"]
                 hold = re.search(r"Your Holdings\s*([\d,]*\.?\d+)", txt)
                 gone = "Locked in Orders" not in txt and hold and num(hold.group(1)) == 0
                 closed = closed + 1 if gone else 0
                 if closed >= 3:
                     return "closed"
-                if price <= floor:
-                    return f"stop-loss: ₦{price} <= ₦{floor:.2f}"
+                if price <= mode["floor"]:
+                    return f"stop-loss: ₦{price} <= ₦{mode['floor']:.2f}"
             except Exception as e:
                 errs += 1
                 if errs in (5, 15):
@@ -471,7 +499,7 @@ async def manage(h):
                     except Exception as e2:
                         log(f"watch recovery failed: {e2}", "warn")
             await asyncio.sleep(POLL)
-    reason = await do(run, f"Watch price (stop-loss -{STOP_LOSS_PCT}%)", watch, tries=1)
+    reason = await do(run, f"Watch price (stop-loss {stop_label()})", watch, tries=1)
     finish(run)
     S["live"] = None
     if reason == "closed":
@@ -731,7 +759,7 @@ async def start_listening():
         S["channel"] = getattr(CHAN, "title", str(CHAN))
         S["tg"], S["tg_err"] = "ready", ""
         tg_ready.set()
-        await notify(f"Bot online. {'DRY RUN' if DRY_RUN else 'LIVE'}, stop-loss -{STOP_LOSS_PCT}%, "
+        await notify(f"Bot online. {'DRY RUN' if DRY_RUN else 'LIVE'}, stop-loss {stop_label()}, "
                      f"stake {'full balance' if not MAX_STAKE else '₦' + str(MAX_STAKE)}. "
                      f"Listening to: {S['channel']}")
     except Exception as e:
@@ -767,6 +795,9 @@ a{color:var(--blue)}.err{color:var(--bad);margin:6px 0;font-size:13px}
 <div class="card"><span id="pill" class="pill idle">...</span> <span id="badges" class="mut" style="font-size:13px"></span>
 <div style="margin-top:10px"><button id="bpause">Pause</button><button id="brecheck">Re-check account</button><button id="bsell" class="red">Force sell</button></div></div>
 <div class="card" id="tgcard" style="display:none"></div>
+<div class="card"><h2>Stop-loss</h2><div class="mut" id="slnow" style="margin-bottom:6px"></div>
+<input id="slin" type="number" inputmode="numeric" placeholder="Sell if my position falls to ₦ (e.g. 2000)" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px;border:1px solid var(--line);background:#0b0d10;color:var(--tx);font-size:15px">
+<button id="slsave">Save</button><button id="sloff">Use % instead</button><div id="slmsg" class="mut" style="margin-top:6px"></div></div>
 <div class="card"><h2>Position</h2><div id="pos"></div></div>
 <div class="card"><h2>Steps (newest first)</h2><div id="runs"></div></div>
 <div class="card"><h2>Screenshots</h2><div id="shots" class="mut"></div></div>
@@ -794,9 +825,15 @@ function renderTg(s){const key=s.tg+'|'+(s.tg_session||'')+'|'+(s.tg_err||'');if
  else if(s.tg==='connecting'){c.append(el('div','mut','Connecting...'))}
  if(s.tg_session){c.append(el('div','mut','Logged in. To survive restarts, paste this into Render > Environment > TG_SESSION and save (keep it secret):'));
   const ta=el('textarea');ta.readOnly=true;ta.value=s.tg_session;ta.style.cssText='width:100%;height:90px;margin-top:6px;background:#0b0d10;color:var(--tx);border:1px solid var(--line);border-radius:10px;font:12px monospace';ta.onclick=()=>ta.select();c.append(ta)}}
-function render(s){last=s;renderTg(s);const p=$('#pill');p.textContent=s.status.toUpperCase();
+let slInit=false;
+function renderSl(s){const w=s.pos_value?' (worth ₦'+s.pos_value.toFixed(0)+' now)':'';
+ $('#slnow').textContent=s.stop_value?('Sell when your position falls to ₦'+s.stop_value+w):('No value set: selling at -'+s.pct+'% from entry'+w);
+ if(!slInit){$('#slin').value=s.stop_value||'';slInit=true}}
+async function saveStop(v){const r=await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
+ const d=await r.json();const m=$('#slmsg');m.className=d.ok?'mut':'err';m.textContent=d.ok?'Saved.':d.error;tick()}
+function render(s){last=s;renderTg(s);renderSl(s);const p=$('#pill');p.textContent=s.status.toUpperCase();
  p.className='pill '+(s.status==='error'?'bad':s.status==='idle'?'idle':s.status==='selling'?'warn':'ok');
- $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · stop-loss -'+s.sl+'% · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg);
+ $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · stop-loss '+s.sl+' · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg);
  $('#bpause').textContent=s.paused?'Resume':'Pause';
  const pos=$('#pos');pos.replaceChildren();const t=s.trade,L=s.live;
  if(!t){pos.append(el('div','mut','No open position'))}else{
@@ -815,6 +852,8 @@ function render(s){last=s;renderTg(s);const p=$('#pill');p.textContent=s.status.
  if(!s.shots.length)sh.textContent='None yet';
  const lg=$('#logs');lg.replaceChildren();s.logs.forEach(x=>lg.append(el('div','log '+x.lvl,x.t+'  '+x.msg)))}
 async function tick(){try{render(await api('/api/state'))}catch(e){$('#pill').textContent='OFFLINE';$('#pill').className='pill bad'}}
+$('#slsave').onclick=()=>saveStop(parseFloat($('#slin').value||0));
+$('#sloff').onclick=()=>{$('#slin').value='';saveStop(0)};
 $('#bpause').onclick=async()=>{await api(last&&last.paused?'/api/resume':'/api/pause',true);tick()};
 $('#brecheck').onclick=async()=>{await api('/api/recheck',true);tick()};
 $('#bsell').onclick=async()=>{if(confirm('Cancel the auto-sell and sell everything now?')){await api('/api/sell',true);tick()}};
@@ -849,7 +888,8 @@ def build_app():
             L["changed_ago"] = time.time() - L["changed"]
             L["updated_ago"] = time.time() - (L["updated"] or time.time())
         return web.json_response({
-            "status": S["status"], "paused": S["paused"], "dry": DRY_RUN, "sl": STOP_LOSS_PCT,
+            "status": S["status"], "paused": S["paused"], "dry": DRY_RUN, "sl": stop_label(), "stop_value": S["stop_value"], "pct": STOP_LOSS_PCT,
+            "pos_value": (S["qty"] * L["price"]) if (L and L.get("price")) else None,
             "uptime": time.time() - S["started"], "trade": S["trade"], "live": L,
             "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
             "runs": list(RUNS), "logs": list(LOGS)[-80:][::-1],
@@ -918,6 +958,26 @@ def build_app():
             await start_listening()
         return web.json_response({"ok": True})
 
+    async def set_stop(request):
+        try:
+            v = float((await jbody(request)).get("value") or 0)
+        except Exception:
+            return web.json_response({"ok": False, "error": "Enter a number, e.g. 2000"})
+        if v < 0:
+            return web.json_response({"ok": False, "error": "Can't be negative"})
+        L = S["live"]
+        if v and L and L.get("price") and S["qty"] and v >= S["qty"] * L["price"]:
+            return web.json_response({"ok": False, "error": (
+                f"₦{v:.0f} is not below your position's current worth (₦{S['qty'] * L['price']:.0f}). "
+                f"It would sell immediately. Pick a lower number.")})
+        S["stop_value"] = v
+        try:
+            json.dump({"stop_value": v}, open(SETTINGS_FILE, "w"))
+        except Exception:
+            pass
+        log(f"Stop-loss changed from dashboard: {stop_label()}", "notify")
+        return web.json_response({"ok": True})
+
     async def get_shot(request):
         i = int(request.match_info["i"])
         for s in SHOTS:
@@ -928,7 +988,7 @@ def build_app():
     app = web.Application(middlewares=[auth])
     app.add_routes([web.get("/", index), web.get("/health", index), web.get("/api/state", state),
                     web.post("/api/pause", pause), web.post("/api/resume", resume),
-                    web.post("/api/sell", sell), web.post("/api/recheck", recheck),
+                    web.post("/api/sell", sell), web.post("/api/recheck", recheck), web.post("/api/stop", set_stop),
                     web.post("/api/tg/phone", tg_phone), web.post("/api/tg/code", tg_code),
                     web.post("/api/tg/password", tg_password), web.post("/api/tg/retry", tg_retry),
                     web.get("/shot/{i}", get_shot)])
