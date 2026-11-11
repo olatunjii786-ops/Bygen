@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""
+bygens copy-trade bot - ONE file: Telegram listener + Playwright trader + web dashboard.
+
+  python bot.py             -> run the bot (this is what Render runs). Open its web page to log in to
+                               Telegram once; the channel is found automatically from its invite link.
+
+Every step first checks the real state of the website (are we already holding the token? is the
+auto-sell still pending? is the sell sheet already open?) and skips what's already done, so it can
+resume safely after a crash, a restart, or a trade you opened yourself.
+"""
+import asyncio
+import base64
+import collections
+import hmac
+import itertools
+import json
+import math
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, UserAlreadyParticipantError
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.types import ChatInviteAlready
+
+
+def need(k):
+    v = os.environ.get(k)
+    if not v:
+        sys.exit(f"Missing environment variable: {k}")
+    return v
+
+
+# ------------------------------------------------------------------ config
+API_ID, API_HASH = int(need("TG_API_ID")), need("TG_API_HASH")
+CHANNEL = os.environ.get("CHANNEL", "").strip()        # optional override; normally auto-detected
+if CHANNEL:
+    CHANNEL = int(CHANNEL) if CHANNEL.lstrip("-").isdigit() else CHANNEL
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/+KVYWoTt2Tk5kMjQ0")
+ENV_SESSION = bool(os.environ.get("TG_SESSION"))
+SITE_EMAIL, SITE_PASSWORD = need("SITE_EMAIL"), need("SITE_PASSWORD")
+UI_PASSWORD = need("UI_PASSWORD")
+E = os.environ
+TZ = ZoneInfo(E.get("TZ_NAME", "Africa/Lagos"))
+DRY_RUN = E.get("DRY_RUN", "1") == "1"
+MAX_STAKE = float(E.get("MAX_STAKE", "0"))            # 0 = full balance
+MIN_STAKE = 1000.0
+STOP_LOSS_PCT = float(E.get("STOP_LOSS_PCT", "3"))
+POLL = float(E.get("POLL_SECONDS", "2"))
+DAY_OFFSETS = {int(x) for x in E.get("ALLOWED_DAY_OFFSETS", "0").split(",")}
+CATCHUP_MIN = int(E.get("CATCHUP_MINUTES", "20"))     # after a restart, still act on calls this recent
+PORT = int(E.get("PORT", "10000"))
+DASH = "https://bygens.app/dashboard"
+NAIRA = r"₦\s*([\d,]+(?:\.\d+)?)"
+USED_FILE = "/tmp/used_orders.json"
+
+# ------------------------------------------------------------------ shared state (shown in the UI)
+S = {"status": "starting", "paused": False, "busy": False, "trade": None, "live": None,
+     "started": time.time(), "tg": "connecting", "tg_err": "", "tg_session": None, "channel": None}
+TG = {}
+CHAN = None
+tg_ready = asyncio.Event()
+_handlers_added = False
+RUNS = collections.deque(maxlen=15)
+LOGS = collections.deque(maxlen=300)
+SHOTS = collections.deque(maxlen=12)
+_ids = itertools.count(1)
+queue = asyncio.Queue()
+force = asyncio.Event()
+client = TelegramClient(StringSession(os.environ.get("TG_SESSION", "")), API_ID, API_HASH)
+pw = browser = ctx = page = None
+try:
+    used = set(json.load(open(USED_FILE)))
+except Exception:
+    used = set()
+
+
+class Fatal(Exception):
+    """Don't retry this."""
+
+
+class StepFailed(Exception):
+    pass
+
+
+def now_s():
+    return datetime.now(TZ).strftime("%H:%M:%S")
+
+
+def log(msg, lvl="info"):
+    LOGS.append({"t": now_s(), "lvl": lvl, "msg": msg})
+    print(f"[{lvl}] {msg}", flush=True)
+
+
+async def notify(msg):
+    log(msg, "notify")
+    try:
+        await client.send_message("me", "🤖 " + msg)
+    except Exception as e:
+        log(f"telegram notify failed: {e}", "warn")
+
+
+async def shot(name):
+    try:
+        data = await page.screenshot(type="jpeg", quality=55)
+        SHOTS.appendleft({"id": next(_ids), "name": name, "t": now_s(), "data": data})
+    except Exception:
+        pass
+
+
+def num(s):
+    return float(s.replace(",", "").replace(" ", ""))
+
+
+# ------------------------------------------------------------------ step tracking
+def new_run(title):
+    r = {"id": next(_ids), "title": title, "t": now_s(), "status": "running", "steps": []}
+    RUNS.appendleft(r)
+    return r
+
+
+def finish(run):
+    if run["status"] == "running":
+        run["status"] = "ok"
+
+
+class St:
+    def __init__(self, rec):
+        self.rec = rec
+
+    def note(self, s):
+        self.rec["detail"] = str(s)[:300]
+
+    def skip(self, s):
+        self.rec["status"] = "skipped"
+        self.rec["detail"] = str(s)[:300]
+
+
+async def do(run, name, fn, tries=2):
+    rec = {"name": name, "status": "running", "detail": "", "t": now_s()}
+    run["steps"].append(rec)
+    st, err = St(rec), None
+    for i in range(1, tries + 1):
+        rec["status"] = "running"
+        try:
+            r = await fn(st)
+            if rec["status"] == "running":
+                rec["status"] = "ok"
+            if rec["detail"].startswith("attempt"):
+                rec["detail"] += " (recovered)"
+            return r
+        except asyncio.CancelledError:
+            raise
+        except Fatal as e:
+            err = e
+            rec["detail"] = str(e)[:300]
+            break
+        except Exception as e:
+            err = e
+            rec["detail"] = f"attempt {i}/{tries}: {e}"[:300]
+            log(f"{name}: {rec['detail']}", "warn")
+            await shot(name)
+            await asyncio.sleep(1.5)
+    rec["status"] = "failed"
+    run["status"] = "failed"
+    await shot("FAILED " + name)
+    raise StepFailed(f"{name}: {err}")
+
+
+# ------------------------------------------------------------------ browser helpers
+async def launch_browser():
+    global pw, browser, ctx, page
+    from playwright.async_api import async_playwright
+    if pw is None:
+        pw = await async_playwright().start()
+    try:
+        if browser:
+            await browser.close()
+    except Exception:
+        pass
+    browser = await pw.chromium.launch(
+        headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+    ctx = await browser.new_context(**pw.devices["Pixel 7"])   # layout was captured on mobile
+
+    async def block(route):                                    # save RAM on the free tier
+        if route.request.resource_type in ("image", "media", "font"):
+            await route.abort()
+        else:
+            await route.continue_()
+    await ctx.route("**/*", block)
+    page = await ctx.new_page()
+    log("browser launched")
+
+
+async def alive():
+    try:
+        await page.evaluate("1")
+        return True
+    except Exception:
+        return False
+
+
+async def vis(text, exact=False, t=1500):
+    try:
+        await page.get_by_text(text, exact=exact).first.wait_for(state="visible", timeout=t)
+        return True
+    except Exception:
+        return False
+
+
+async def wait_enabled(loc, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        try:
+            if await loc.first.is_enabled(timeout=500):
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    raise RuntimeError("button not enabled in time")
+
+
+async def sheet_text():
+    d = page.locator('[role="dialog"]:visible')
+    if await d.count() == 0:
+        raise RuntimeError("no sheet open")
+    return await d.last.inner_text()
+
+
+async def open_dashboard():
+    if not await alive():
+        await launch_browser()
+    await page.goto(DASH, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+    if "/auth/login" in page.url:
+        await page.get_by_placeholder("name@example.com").fill(SITE_EMAIL)
+        await page.locator('input[type="password"]').fill(SITE_PASSWORD)
+        await page.get_by_role("button", name="Sign in").click()
+        await page.wait_for_url("**/dashboard**", timeout=20000)
+        await page.wait_for_timeout(1500)
+        log("logged in")
+
+
+HOLD_RE = re.compile(r"([\d,]*\.?\d+)\s+([A-Za-z0-9$]+)\s*\(\s*([\d,]*\.?\d+)\s*\+\s*([\d,]*\.?\d+)\s*locked\s*\)")
+HOLD_RE2 = re.compile(r"^\s*([\d,]*\.?\d+)\s+([A-Z][A-Z0-9$]+)\s*$", re.M)
+
+
+def parse_holdings(body):
+    hs = [{"symbol": m[1], "avail": num(m[2]), "locked": num(m[3])} for m in HOLD_RE.findall(body)]
+    if not hs:
+        hs = [{"symbol": m[1], "avail": num(m[0]), "locked": 0.0} for m in HOLD_RE2.findall(body)]
+    return hs
+
+
+async def holdings():
+    """Ground truth from the dashboard: list of tokens we hold. [] = nothing."""
+    await open_dashboard()
+    empty_seen = 0
+    for _ in range(12):
+        body = await page.locator("body").inner_text()
+        if "No token holdings yet" in body:
+            empty_seen += 1                       # must be seen twice: guards against a half-loaded page
+            if empty_seen >= 2:
+                return []
+        else:
+            hs = parse_holdings(body)
+            if hs:
+                return hs
+        await asyncio.sleep(1.2)
+    raise RuntimeError("couldn't read holdings from dashboard")
+
+
+async def open_token(sym):
+    await open_dashboard()
+    await page.get_by_text(re.compile(rf"[\d.,]+\s*{re.escape(sym)}", re.I)).first.click()
+    await page.get_by_text("Pending Orders", exact=True).wait_for(timeout=10000)
+
+
+async def read_balance():
+    try:
+        await open_dashboard()
+        body = await page.locator("body").inner_text()
+        m = re.search(r"Total Balance\s*₦\s*([\d,]+\s*\.?\s*\d*)", body)
+        return re.sub(r"\s", "", m.group(1)) if m else "?"
+    except Exception:
+        return "?"
+
+
+# ------------------------------------------------------------------ BUY
+async def process_call(order_id):
+    run = new_run(f"Copy order {order_id[:8]}")
+    ctxd = {}
+    S["status"] = "buying"
+    try:
+        async def s_check(st):
+            hs = await holdings()
+            st.note(f"Already holding {hs[0]['symbol']}" if hs else "No open position")
+            return hs
+        hs = await do(run, "Check for an open position", s_check)
+        if hs:
+            finish(run)
+            log("Already in a trade, skipping buy and managing it.")
+            await manage(hs[0])
+            return
+
+        async def s_open(st):
+            if await vis("Paste order ID here", t=800) or await vis("Take Profit Price", t=300):
+                return st.skip("Copy Trade sheet already open")
+            await page.get_by_text("Copy Trade", exact=True).first.click()
+            await page.get_by_placeholder("Paste order ID here").wait_for(timeout=8000)
+        await do(run, "Open Copy Trade", s_open)
+
+        async def s_load(st):
+            if await vis("Take Profit Price", t=500):
+                return st.skip("order already loaded")
+            await page.get_by_placeholder("Paste order ID here").fill(order_id)
+            await page.get_by_role("button", name="Load Order").click()
+            try:
+                await page.get_by_text("Take Profit Price").wait_for(timeout=10000)
+            except Exception:
+                raise RuntimeError("order didn't load (expired / invalid / already used?)")
+        await do(run, "Enter order ID and load it", s_load)
+
+        async def s_read(st):
+            text = await sheet_text()
+            ctxd["price"] = num(re.search(r"Current Price:\s*" + NAIRA, text).group(1))
+            after = text.split("copy a take profit trade", 1)[-1].strip().splitlines()
+            ctxd["symbol"] = after[0].strip()
+            ctxd["max"] = num(re.findall(NAIRA, text.split("How much NGN", 1)[-1])[-1])
+            st.note(f"{ctxd['symbol']} at ₦{ctxd['price']}, available ₦{ctxd['max']}")
+        await do(run, "Read token, price and balance", s_read)
+
+        async def s_stake(st):
+            stake = math.floor(ctxd["max"])
+            if MAX_STAKE:
+                stake = min(stake, int(MAX_STAKE))
+            if stake < MIN_STAKE:
+                raise Fatal(f"Balance ₦{ctxd['max']} is below the ₦{MIN_STAKE:.0f} minimum")
+            ctxd["stake"] = stake
+            inp = page.locator("input:visible").last
+            if re.sub(r"\D", "", (await inp.input_value()).split(".")[0]) == str(stake):
+                return st.skip(f"₦{stake} already entered")
+            await inp.click()
+            await inp.fill(str(stake))
+            if re.sub(r"\D", "", (await inp.input_value()).split(".")[0]) != str(stake):
+                if MAX_STAKE and ctxd["max"] > MAX_STAKE:
+                    raise Fatal("Typing failed and slider would exceed MAX_STAKE")
+                await page.locator('input[type=range], [role=slider]').first.focus()
+                await page.keyboard.press("End")
+                st.note("typed input failed, used slider at 100%")
+            else:
+                st.note(f"typed ₦{stake}")
+        await do(run, "Enter stake amount", s_stake)
+
+        async def s_confirm(st):
+            if not await vis("Take Profit Price", t=500):
+                return st.skip("sheet already closed (trade was submitted)")
+            btn = page.get_by_role("button", name="Copy Trade").last
+            await wait_enabled(btn, 6)
+            if DRY_RUN:
+                await shot("dry-run ready to confirm")
+                await page.get_by_role("button", name="Cancel").click()
+                ctxd["dry"] = True
+                return st.note("DRY RUN: stopped before the final tap")
+            await btn.click()
+            await page.get_by_text("Take Profit Price").wait_for(state="hidden", timeout=15000)
+        await do(run, "Tap Copy Trade (confirm)", s_confirm, tries=1)
+        if ctxd.get("dry"):
+            finish(run)
+            await notify(f"DRY RUN OK: would stake ₦{ctxd['stake']} on {ctxd['symbol']} at ₦{ctxd['price']}")
+            return
+
+        async def s_verify(st):
+            for _ in range(10):
+                m = [h for h in await holdings() if h["symbol"].lower() == ctxd["symbol"].lower()]
+                if m:
+                    st.note(f"holding {m[0]['avail'] + m[0]['locked']} {m[0]['symbol']}")
+                    return m[0]
+                await asyncio.sleep(2)
+            raise RuntimeError("position not visible after confirming")
+        h = await do(run, "Verify position opened", s_verify, tries=1)
+        finish(run)
+        S["trade"] = {"symbol": h["symbol"], "entry": ctxd["price"], "stake": ctxd["stake"],
+                      "opened": now_s(), "baseline": False}
+        await notify(f"BOUGHT {h['symbol']}: ₦{ctxd['stake']} at ₦{ctxd['price']}. Stop-loss -{STOP_LOSS_PCT}%.")
+        await manage(h)
+    except Exception as e:
+        run["status"] = "failed"
+        S["status"] = "error"
+        await notify(f"BUY FAILED: {e}. Re-checking account state...")
+        await reconcile("after failed buy")
+
+
+# ------------------------------------------------------------------ MANAGE (watch + stop-loss)
+async def manage(h):
+    sym = h["symbol"]
+    S["status"] = f"holding {sym}"
+    run = new_run(f"Manage {sym}")
+    t = S["trade"] if S["trade"] and S["trade"]["symbol"].lower() == sym.lower() else None
+
+    async def s_open(st):
+        try:
+            txt = await sheet_text()
+            if sym.lower() in txt.lower() and "Pending Orders" in txt:
+                return st.skip("token sheet already open")
+        except Exception:
+            pass
+        await open_token(sym)
+    await do(run, "Open token page", s_open)
+
+    async def s_base(st):
+        nonlocal t
+        price = num(re.search(NAIRA, await sheet_text()).group(1))
+        if t:
+            return st.note(f"entry ₦{t['entry']}")
+        t = S["trade"] = {"symbol": sym, "entry": price, "stake": None, "opened": now_s(), "baseline": True}
+        st.note(f"Trade pre-dates the bot, so ₦{price} (price now) is used as the entry for the stop-loss")
+    await do(run, "Record entry price", s_base)
+
+    async def watch(st):
+        floor = t["entry"] * (1 - STOP_LOSS_PCT / 100)
+        S["live"] = {"price": None, "floor": floor, "updated": None, "changed": time.time()}
+        last, closed, errs = None, 0, 0
+        st.note(f"stop-loss at ₦{floor:.2f}")
+        while True:
+            if force.is_set():
+                return "manual"
+            try:
+                txt = await sheet_text()
+                price = num(re.search(NAIRA, txt).group(1))
+                L = S["live"]
+                L["price"], L["updated"] = price, time.time()
+                if price != last:
+                    L["changed"], last = time.time(), price
+                errs = 0
+                hold = re.search(r"Your Holdings\s*([\d,]*\.?\d+)", txt)
+                gone = "Locked in Orders" not in txt and hold and num(hold.group(1)) == 0
+                closed = closed + 1 if gone else 0
+                if closed >= 3:
+                    return "closed"
+                if price <= floor:
+                    return f"stop-loss: ₦{price} <= ₦{floor:.2f}"
+            except Exception as e:
+                errs += 1
+                if errs in (5, 15):
+                    log(f"watch read errors x{errs}: {e}", "warn")
+                if errs % 5 == 0:
+                    try:
+                        if not await holdings():
+                            return "closed"
+                        await open_token(sym)
+                    except Exception as e2:
+                        log(f"watch recovery failed: {e2}", "warn")
+            await asyncio.sleep(POLL)
+    reason = await do(run, f"Watch price (stop-loss -{STOP_LOSS_PCT}%)", watch, tries=1)
+    finish(run)
+    S["live"] = None
+    if reason == "closed":
+        S["trade"], S["status"] = None, "idle"
+        await notify(f"{sym} position closed (take-profit filled or sold). Balance: ₦{await read_balance()}")
+        return
+    ok = await exit_position(sym, reason)
+    S["trade"] = None
+    S["status"] = "idle" if ok else "error"
+    force.clear()
+
+
+# ------------------------------------------------------------------ EXIT
+async def exit_position(sym, reason):
+    S["status"] = "selling"
+    await notify(f"EXIT {sym}: {reason}. Selling now...")
+    for attempt in range(1, 6):
+        run = new_run(f"Exit {sym}, attempt {attempt} ({reason[:30]})")
+        try:
+            await sell_steps(run, sym)
+            finish(run)
+            await notify(f"SOLD {sym}. Balance: ₦{await read_balance()}")
+            return True
+        except Exception as e:
+            run["status"] = "failed"
+            await notify(f"Sell attempt {attempt}/5 failed: {e}")
+            await asyncio.sleep(5)
+    await notify("COULD NOT SELL AFTER 5 ATTEMPTS. OPEN THE APP AND SELL MANUALLY NOW.")
+    return False
+
+
+async def sell_steps(run, sym):
+    async def s_check(st):
+        hs = [h for h in await holdings() if h["symbol"].lower() == sym.lower()]
+        if not hs:
+            st.note("nothing held, already sold")
+        return hs
+    if not await do(run, "Check position still open", s_check):
+        return
+
+    async def s_open(st):
+        try:
+            txt = await sheet_text()
+            if "Sell Now" in txt or ("Pending Orders" in txt and sym.lower() in txt.lower()):
+                return st.skip("sheet already open")
+        except Exception:
+            pass
+        await open_token(sym)
+    await do(run, "Open token page", s_open)
+
+    async def s_cancel(st):
+        if await vis("Sell Now", exact=True, t=400):
+            return st.skip("sell sheet already open")
+        await page.get_by_text("Pending Orders", exact=True).click()
+        if await vis("No pending orders", t=1500):
+            return st.skip("no auto-sell order (already cancelled)")
+        for _ in range(3):
+            row = page.locator("xpath=//*[contains(text(),'Auto-sell')]/ancestor::div[.//button][1]")
+            await row.locator("button:visible").last.click()          # the X
+            if await vis("No pending orders", t=4000):
+                st.note("auto-sell cancelled")
+                return
+        raise RuntimeError("auto-sell still listed after 3 taps on X")
+    await do(run, "Cancel auto-sell order (X)", s_cancel)
+
+    async def s_tap(st):
+        if await vis("Sell Now", exact=True, t=500):
+            return st.skip("sell sheet already open")
+        btn = page.get_by_role("button", name="Sell", exact=True)
+        await wait_enabled(btn, 12)
+        await btn.click()
+        await page.get_by_role("button", name="Sell Now").wait_for(timeout=8000)
+    await do(run, "Tap Sell", s_tap)
+
+    async def s_amount(st):
+        txt = await sheet_text()
+        if "(All)" in txt:
+            return st.skip("already set to 100%")
+        await page.locator('input[type=range], [role=slider]').first.focus()
+        await page.keyboard.press("End")
+        txt = await sheet_text()
+        if "(All)" in txt:
+            return st.note("slider set to 100%")
+        mx = re.findall(r"([\d.,]+)\s*" + re.escape(sym), txt, re.I)[-1]
+        await page.locator("input:visible").last.fill(mx.replace(",", ""))
+        st.note(f"typed max amount {mx}")
+    await do(run, "Set amount to 100%", s_amount)
+
+    async def s_confirm(st):
+        if not await vis("Sell Now", exact=True, t=500):
+            return st.skip("sell sheet already closed")
+        await page.get_by_role("button", name="Sell Now").click()
+        await page.get_by_role("button", name="Sell Now").wait_for(state="hidden", timeout=15000)
+    await do(run, "Tap Sell Now", s_confirm, tries=1)
+
+    async def s_verify(st):
+        for _ in range(10):
+            if not [h for h in await holdings() if h["symbol"].lower() == sym.lower()]:
+                return st.note("no holdings left")
+            await asyncio.sleep(2)
+        raise RuntimeError("still holding after Sell Now")
+    await do(run, "Verify sold", s_verify)
+
+
+# ------------------------------------------------------------------ RECONCILE (resume from real state)
+async def reconcile(why):
+    run = new_run(f"Check account state ({why})")
+    try:
+        async def s(st):
+            hs = await holdings()
+            st.note(", ".join(f"{h['symbol']} (free {h['avail']}, locked {h['locked']})" for h in hs)
+                    or "no open position")
+            return hs
+        hs = await do(run, "Read account state", s, tries=3)
+        finish(run)
+        if hs:
+            await notify(f"Found open position {hs[0]['symbol']}. Resuming watch.")
+            await manage(hs[0])
+        else:
+            S["trade"], S["status"] = None, "idle"
+    except Exception as e:
+        run["status"] = "failed"
+        S["status"] = "error"
+        log(f"reconcile failed: {e}", "error")
+
+
+# ------------------------------------------------------------------ Telegram intake
+def parse_call(text):
+    m_id = re.search(r"ORDER\s*ID\s*:?\s*([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})", text)
+    if not m_id:
+        return None
+    m_dt = re.search(r"CALL\s*-?\s*(\d{1,2})/(\d{1,2})/(\d{2,4})", text, re.I)
+    return m_id.group(1).lower(), (m_dt.groups() if m_dt else None)
+
+
+def date_ok(parts):
+    if not parts:
+        return False
+    d, m, y = (int(x) for x in parts)                    # day/month/year
+    y += 2000 if y < 100 else 0
+    try:
+        return (datetime(y, m, d).date() - datetime.now(TZ).date()).days in DAY_OFFSETS
+    except ValueError:
+        return False
+
+
+def handle_text(text, src="live"):
+    p = parse_call(text or "")
+    if not p:
+        return
+    oid, parts = p
+    if oid in used:
+        return
+    if not date_ok(parts):
+        log(f"Ignored order {oid[:8]} ({src}): call date {parts} is not an allowed date", "warn")
+        return
+    if S["paused"]:
+        log(f"Paused: skipped order {oid[:8]}", "warn")
+        return
+    if S["busy"]:
+        log(f"Busy or already in a trade: skipped order {oid[:8]}", "warn")
+        return
+    used.add(oid)
+    try:
+        json.dump(sorted(used), open(USED_FILE, "w"))
+    except Exception:
+        pass
+    S["busy"] = True
+    log(f"New call ({src}): order {oid[:8]}")
+    queue.put_nowait(("call", oid))
+
+
+async def catchup():
+    async for m in client.iter_messages(CHAN, limit=10):          # newest first
+        if m.text and datetime.now(timezone.utc) - m.date < timedelta(minutes=CATCHUP_MIN):
+            handle_text(m.text, "catch-up")
+            if S["busy"]:
+                break
+
+
+async def worker():
+    S["busy"] = True
+    try:
+        await reconcile("startup")
+    finally:
+        S["busy"] = not queue.empty()
+    await tg_ready.wait()                                   # wait for Telegram login + channel
+    if not S["trade"]:
+        try:
+            await catchup()
+        except Exception as e:
+            log(f"catch-up failed: {e}", "warn")
+    while True:
+        job = await queue.get()
+        try:
+            if job[0] == "call":
+                await process_call(job[1])
+            else:
+                await reconcile(job[1])
+        except Exception as e:
+            log(f"job crashed: {e}", "error")
+            S["status"] = "error"
+        finally:
+            S["busy"] = not queue.empty()
+            if S["status"] in ("buying", "selling") or S["status"].startswith("holding"):
+                S["status"] = "idle"
+
+
+
+# ------------------------------------------------------------------ Telegram login + channel detection
+async def resolve_channel():
+    if CHANNEL:
+        return CHANNEL
+    h = CHANNEL_LINK.rstrip("/").split("+")[-1].split("joinchat/")[-1]
+    inv = await client(CheckChatInviteRequest(h))
+    if isinstance(inv, ChatInviteAlready):
+        return inv.chat                                     # you are already a member
+    try:
+        upd = await client(ImportChatInviteRequest(h))
+        return upd.chats[0]
+    except UserAlreadyParticipantError:
+        raise RuntimeError("already a member but couldn't resolve the channel; set CHANNEL manually")
+    except Exception as e:
+        if "InviteRequestSent" in type(e).__name__:
+            raise RuntimeError("Join request sent. Wait for the channel admin to approve it, then press Retry.")
+        raise
+
+
+async def on_post(ev):
+    handle_text(ev.raw_text)
+
+
+async def on_cmd(ev):
+    c = (ev.raw_text or "").strip().lower()
+    if c == "/pause":
+        S["paused"] = True
+        await notify("Paused.")
+    elif c == "/resume":
+        S["paused"] = False
+        await notify("Resumed.")
+    elif c == "/sell":
+        force.set()
+        await notify("Force sell requested.")
+    elif c == "/status":
+        await notify(f"status={S['status']} paused={S['paused']} dry_run={DRY_RUN}")
+
+
+async def start_listening():
+    global CHAN, _handlers_added
+    try:
+        CHAN = await resolve_channel()
+        if not _handlers_added:
+            client.add_event_handler(on_post, events.NewMessage(chats=CHAN))
+            client.add_event_handler(on_post, events.MessageEdited(chats=CHAN))
+            client.add_event_handler(on_cmd, events.NewMessage(chats="me"))
+            _handlers_added = True
+        S["channel"] = getattr(CHAN, "title", str(CHAN))
+        S["tg"], S["tg_err"] = "ready", ""
+        tg_ready.set()
+        await notify(f"Bot online. {'DRY RUN' if DRY_RUN else 'LIVE'}, stop-loss -{STOP_LOSS_PCT}%, "
+                     f"stake {'full balance' if not MAX_STAKE else '₦' + str(MAX_STAKE)}. "
+                     f"Listening to: {S['channel']}")
+    except Exception as e:
+        S["tg"], S["tg_err"] = "channel_error", f"{type(e).__name__}: {e}"
+        log(f"channel setup failed: {e}", "error")
+
+
+async def after_login():
+    S["tg_err"] = ""
+    if not ENV_SESSION:
+        S["tg_session"] = client.session.save()
+    await start_listening()
+
+# ------------------------------------------------------------------ web dashboard
+PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Copy-trade bot</title>
+<style>
+:root{--bg:#0b0d10;--card:#14181d;--line:#232a32;--tx:#e8edf2;--mut:#8a96a3;--ok:#2fd13a;--bad:#ff5c5c;--warn:#f5b942;--blue:#5aa9ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,sans-serif;padding:12px;max-width:760px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:12px}
+h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);margin:0 0 8px}
+.pill{display:inline-block;padding:4px 12px;border-radius:99px;font-weight:700;font-size:13px}
+.pill.ok{background:#12351a;color:var(--ok)}.pill.idle{background:#222a33;color:var(--mut)}.pill.bad{background:#3a1717;color:var(--bad)}.pill.warn{background:#3a2d10;color:var(--warn)}
+.mut{color:var(--mut)}.kv{display:flex;justify-content:space-between;padding:3px 0}
+button{background:#1d242c;color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:9px 14px;font-size:14px;margin-right:6px}
+button.red{border-color:#6b2a2a;color:var(--bad)}
+details{border-top:1px solid var(--line);padding:8px 0}summary{cursor:pointer}
+.step{display:flex;gap:8px;padding:4px 0 0 4px}.step .nm{flex:1}.step .tm{color:var(--mut);font-size:12px}
+.step.failed .nm{color:var(--bad)}.step.skipped .nm{color:var(--mut)}.det{margin:0 0 4px 30px;font-size:13px;color:var(--mut)}
+.step.failed+.det{color:var(--bad)}.log{font:12px/1.5 ui-monospace,monospace;padding:1px 0}.log.warn{color:var(--warn)}.log.error{color:var(--bad)}.log.notify{color:var(--blue)}
+a{color:var(--blue)}.err{color:var(--bad);margin:6px 0;font-size:13px}
+</style></head><body>
+<div class="card"><span id="pill" class="pill idle">...</span> <span id="badges" class="mut" style="font-size:13px"></span>
+<div style="margin-top:10px"><button id="bpause">Pause</button><button id="brecheck">Re-check account</button><button id="bsell" class="red">Force sell</button></div></div>
+<div class="card" id="tgcard" style="display:none"></div>
+<div class="card"><h2>Position</h2><div id="pos"></div></div>
+<div class="card"><h2>Steps (newest first)</h2><div id="runs"></div></div>
+<div class="card"><h2>Screenshots</h2><div id="shots" class="mut"></div></div>
+<div class="card"><h2>Log</h2><div id="logs"></div></div>
+<script>
+const $=s=>document.querySelector(s);const ICON={ok:'✅',failed:'❌',skipped:'⏭️',running:'⏳'};
+const openIds=new Set(),seen=new Set();let last=null;
+function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e}
+function fmt(s){s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m'}
+async function api(p,post){const r=await fetch(p,{method:post?'POST':'GET'});return r.json()}
+function kv(k,v,c){const d=el('div','kv');d.append(el('span','mut',k),el('b',c||'',v));return d}
+let tgKey='';
+function renderTg(s){const key=s.tg+'|'+(s.tg_session||'')+'|'+(s.tg_err||'');if(key===tgKey)return;tgKey=key;
+ const c=$('#tgcard');c.replaceChildren();const show=s.tg!=='ready'||s.tg_session;c.style.display=show?'block':'none';if(!show)return;
+ c.append(el('h2','','Telegram'));if(s.tg_err)c.append(el('div','err',s.tg_err));
+ const inp=(ph,t)=>{const i=el('input');i.placeholder=ph;i.type=t||'text';i.style.cssText='width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid var(--line);background:#0b0d10;color:var(--tx);font-size:15px';return i};
+ const post=async(p,b)=>{await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});tick()};
+ if(s.tg==='login_needed'){c.append(el('div','mut','Phone number with country code, e.g. +2348012345678. Telegram sends the login code inside your Telegram app.'));
+  const i=inp('+234...','tel'),b=el('button','','Send code');b.onclick=()=>post('/api/tg/phone',{phone:i.value});c.append(i,b)}
+ else if(s.tg==='code_sent'){c.append(el('div','mut','Enter the code Telegram sent you (check your Telegram app).'));
+  const i=inp('12345','tel'),b=el('button','','Log in');b.onclick=()=>post('/api/tg/code',{code:i.value});c.append(i,b)}
+ else if(s.tg==='need_password'){c.append(el('div','mut','Enter your Telegram two-step verification password.'));
+  const i=inp('password','password'),b=el('button','','Log in');b.onclick=()=>post('/api/tg/password',{password:i.value});c.append(i,b)}
+ else if(s.tg==='channel_error'){const b=el('button','','Retry');b.onclick=()=>post('/api/tg/retry');c.append(b)}
+ else if(s.tg==='connecting'){c.append(el('div','mut','Connecting...'))}
+ if(s.tg_session){c.append(el('div','mut','Logged in. To survive restarts, paste this into Render > Environment > TG_SESSION and save (keep it secret):'));
+  const ta=el('textarea');ta.readOnly=true;ta.value=s.tg_session;ta.style.cssText='width:100%;height:90px;margin-top:6px;background:#0b0d10;color:var(--tx);border:1px solid var(--line);border-radius:10px;font:12px monospace';ta.onclick=()=>ta.select();c.append(ta)}}
+function render(s){last=s;renderTg(s);const p=$('#pill');p.textContent=s.status.toUpperCase();
+ p.className='pill '+(s.status==='error'?'bad':s.status==='idle'?'idle':s.status==='selling'?'warn':'ok');
+ $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · stop-loss -'+s.sl+'% · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg);
+ $('#bpause').textContent=s.paused?'Resume':'Pause';
+ const pos=$('#pos');pos.replaceChildren();const t=s.trade,L=s.live;
+ if(!t){pos.append(el('div','mut','No open position'))}else{
+  pos.append(kv('Token',t.symbol),kv('Stake',t.stake?'₦'+t.stake:'(opened before bot)'),kv('Entry','₦'+t.entry+(t.baseline?' (baseline)':'')));
+  if(L&&L.price!==null){const dp=((L.price/t.entry-1)*100).toFixed(2);
+   pos.append(kv('Price now','₦'+L.price+' ('+dp+'%)',dp<0?'color:var(--bad)':''),kv('Stop-loss at','₦'+L.floor.toFixed(2)),
+   kv('Price last changed',fmt(L.changed_ago)+' ago',L.changed_ago>600?'color:var(--warn)':''),kv('Last read',fmt(L.updated_ago)+' ago'))}}
+ const runs=$('#runs');runs.replaceChildren();
+ s.runs.forEach(r=>{if(!seen.has(r.id)){seen.add(r.id);if(r.status!=='ok')openIds.add(r.id)}
+  const d=el('details');d.open=openIds.has(r.id);d.addEventListener('toggle',()=>{d.open?openIds.add(r.id):openIds.delete(r.id)});
+  const sm=el('summary');sm.append(el('span','',(ICON[r.status]||'•')+' '),el('b','',r.title),el('span','mut','  '+r.t));d.append(sm);
+  r.steps.forEach(x=>{const row=el('div','step '+x.status);row.append(el('span','',ICON[x.status]||'•'),el('span','nm',x.name),el('span','tm',x.t));d.append(row);
+   if(x.detail)d.append(el('div','det',x.detail))});runs.append(d)});
+ if(!s.runs.length)runs.append(el('div','mut','Nothing yet. Waiting for a call.'));
+ const sh=$('#shots');sh.replaceChildren();s.shots.forEach(x=>{const a=el('a','',x.t+'  '+x.name);a.href='/shot/'+x.id;a.target='_blank';sh.append(a,el('br'))});
+ if(!s.shots.length)sh.textContent='None yet';
+ const lg=$('#logs');lg.replaceChildren();s.logs.forEach(x=>lg.append(el('div','log '+x.lvl,x.t+'  '+x.msg)))}
+async function tick(){try{render(await api('/api/state'))}catch(e){$('#pill').textContent='OFFLINE';$('#pill').className='pill bad'}}
+$('#bpause').onclick=async()=>{await api(last&&last.paused?'/api/resume':'/api/pause',true);tick()};
+$('#brecheck').onclick=async()=>{await api('/api/recheck',true);tick()};
+$('#bsell').onclick=async()=>{if(confirm('Cancel the auto-sell and sell everything now?')){await api('/api/sell',true);tick()}};
+tick();setInterval(tick,2500);
+</script></body></html>"""
+
+
+def build_app():
+    from aiohttp import web
+
+    @web.middleware
+    async def auth(request, handler):
+        if request.path == "/health":
+            return web.Response(text="ok")
+        ok = False
+        h = request.headers.get("Authorization", "")
+        if h.startswith("Basic "):
+            try:
+                ok = hmac.compare_digest(base64.b64decode(h[6:]).decode().partition(":")[2], UI_PASSWORD)
+            except Exception:
+                pass
+        if not ok:
+            return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="bot"'})
+        return await handler(request)
+
+    async def index(_):
+        return web.Response(text=PAGE, content_type="text/html")
+
+    async def state(_):
+        L = dict(S["live"]) if S["live"] else None
+        if L:
+            L["changed_ago"] = time.time() - L["changed"]
+            L["updated_ago"] = time.time() - (L["updated"] or time.time())
+        return web.json_response({
+            "status": S["status"], "paused": S["paused"], "dry": DRY_RUN, "sl": STOP_LOSS_PCT,
+            "uptime": time.time() - S["started"], "trade": S["trade"], "live": L,
+            "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
+            "runs": list(RUNS), "logs": list(LOGS)[-80:][::-1],
+            "shots": [{k: v for k, v in s.items() if k != "data"} for s in SHOTS]})
+
+    async def pause(_):
+        S["paused"] = True
+        log("Paused from dashboard")
+        return web.json_response({"ok": True})
+
+    async def resume(_):
+        S["paused"] = False
+        log("Resumed from dashboard")
+        return web.json_response({"ok": True})
+
+    async def sell(_):
+        force.set()
+        log("Force sell requested from dashboard", "warn")
+        return web.json_response({"ok": True})
+
+    async def recheck(_):
+        if S["busy"]:
+            log("Re-check ignored: bot is busy / watching a trade", "warn")
+        else:
+            S["busy"] = True
+            queue.put_nowait(("reconcile", "manual re-check"))
+        return web.json_response({"ok": True})
+
+    async def jbody(request):
+        try:
+            return await request.json()
+        except Exception:
+            return {}
+
+    async def tg_phone(request):
+        phone = str((await jbody(request)).get("phone", "")).strip().replace(" ", "")
+        try:
+            r = await client.send_code_request(phone)
+            TG.update(phone=phone, hash=r.phone_code_hash)
+            S["tg"], S["tg_err"] = "code_sent", ""
+        except Exception as e:
+            S["tg_err"] = f"{type(e).__name__}: {e}"
+        return web.json_response({"ok": True})
+
+    async def tg_code(request):
+        code = str((await jbody(request)).get("code", "")).strip().replace(" ", "")
+        try:
+            await client.sign_in(TG["phone"], code, phone_code_hash=TG["hash"])
+            await after_login()
+        except SessionPasswordNeededError:
+            S["tg"], S["tg_err"] = "need_password", ""
+        except Exception as e:
+            S["tg_err"] = f"{type(e).__name__}: {e}"
+        return web.json_response({"ok": True})
+
+    async def tg_password(request):
+        try:
+            await client.sign_in(password=str((await jbody(request)).get("password", "")))
+            await after_login()
+        except Exception as e:
+            S["tg_err"] = f"{type(e).__name__}: {e}"
+        return web.json_response({"ok": True})
+
+    async def tg_retry(_):
+        if await client.is_user_authorized():
+            await start_listening()
+        return web.json_response({"ok": True})
+
+    async def get_shot(request):
+        i = int(request.match_info["i"])
+        for s in SHOTS:
+            if s["id"] == i:
+                return web.Response(body=s["data"], content_type="image/jpeg")
+        return web.Response(status=404)
+
+    app = web.Application(middlewares=[auth])
+    app.add_routes([web.get("/", index), web.get("/health", index), web.get("/api/state", state),
+                    web.post("/api/pause", pause), web.post("/api/resume", resume),
+                    web.post("/api/sell", sell), web.post("/api/recheck", recheck),
+                    web.post("/api/tg/phone", tg_phone), web.post("/api/tg/code", tg_code),
+                    web.post("/api/tg/password", tg_password), web.post("/api/tg/retry", tg_retry),
+                    web.get("/shot/{i}", get_shot)])
+    return app
+
+
+# ------------------------------------------------------------------ main
+async def main():
+    from aiohttp import web
+    runner = web.AppRunner(build_app())
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()          # open the port first so Render is happy
+    log(f"dashboard on port {PORT}")
+    await launch_browser()
+    await client.connect()
+    asyncio.create_task(worker())
+    if await client.is_user_authorized():
+        await start_listening()
+    else:
+        S["tg"] = "login_needed"
+        log("Telegram login needed: open the dashboard and log in", "warn")
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
