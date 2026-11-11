@@ -237,17 +237,27 @@ async def sheet_text():
 
 
 async def open_dashboard():
+    """Open the dashboard and wait until it has really loaded (logging in if the site asks)."""
     if not await alive():
         await launch_browser()
     await page.goto(DASH, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
-    if "/auth/login" in page.url:
-        await page.get_by_placeholder("name@example.com").fill(SITE_EMAIL)
-        await page.locator('input[type="password"]').fill(SITE_PASSWORD)
-        await page.get_by_role("button", name="Sign in").click()
-        await page.wait_for_url("**/dashboard**", timeout=20000)
-        await page.wait_for_timeout(1500)
-        log("logged in")
+    for _ in range(20):                                   # the site redirects to login a moment late
+        await page.wait_for_timeout(1000)
+        if "/auth/login" in page.url:
+            break
+        try:
+            if "Total Balance" in await page.locator("body").inner_text():
+                return
+        except Exception:
+            pass
+    if "/auth/login" not in page.url:
+        raise RuntimeError("dashboard didn't load in 20s")
+    await page.get_by_placeholder("name@example.com").fill(SITE_EMAIL)
+    await page.locator('input[type="password"]').fill(SITE_PASSWORD)
+    await page.get_by_role("button", name="Sign in").click()
+    await page.wait_for_url("**/dashboard**", timeout=20000)
+    await page.get_by_text("Total Balance").first.wait_for(timeout=15000)
+    log("logged in")
 
 
 HOLD_RE = re.compile(r"([\d,]*\.?\d+)\s+([A-Za-z0-9$]+)\s*\(\s*([\d,]*\.?\d+)\s*\+\s*([\d,]*\.?\d+)\s*locked\s*\)")
