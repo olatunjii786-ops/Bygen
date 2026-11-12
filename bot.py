@@ -56,6 +56,7 @@ MAX_STAKE = float(E.get("MAX_STAKE", "0"))            # 0 = full balance
 MIN_STAKE = 1000.0
 STOP_LOSS_PCT = float(E.get("STOP_LOSS_PCT", "3"))
 MY_RANK = E.get("MY_RANK", "IRON").strip()               # only act on calls whose header names this rank
+RECYCLE = float(E.get("BROWSER_RECYCLE_MINUTES", "30")) * 60   # restart the browser now and then (free-tier memory)
 REFRESH = float(E.get("REFRESH_SECONDS", "45"))      # how often the watch re-checks the real dashboard
 IDLE_CHECK = float(E.get("IDLE_CHECK_SECONDS", "600"))
 STOP_VALUE = float(E.get("STOP_VALUE", "0"))          # >0: sell only when the position is worth this much (₦)
@@ -71,7 +72,7 @@ USED_FILE = "/tmp/used_orders_live.json"        # only REAL (live) orders are re
 # ------------------------------------------------------------------ shared state (shown in the UI)
 S = {"status": "starting", "paused": False, "busy": False, "trade": None, "live": None,
      "started": time.time(), "tg": "connecting", "tg_err": "", "tg_session": None, "channel": None,
-     "hands_off": False, "balance": None, "balance_t": None, "logins": 0, "launches": 0}
+     "hands_off": False, "balance": None, "balance_t": None, "logins": 0, "launches": 0, "launched_at": time.time(), "tok_fail": 0}
 try:                                                      # dashboard value survives soft restarts
     S["stop_value"] = float(json.load(open(SETTINGS_FILE))["stop_value"])
 except Exception:
@@ -197,8 +198,14 @@ async def do(run, name, fn, tries=2):
 
 
 # ------------------------------------------------------------------ browser helpers
-async def launch_browser():
+async def launch_browser(keep_session=False):
     global pw, browser, ctx, page
+    state = None
+    if keep_session and ctx:
+        try:
+            state = await ctx.storage_state()          # cookies etc., so recycling doesn't log you out
+        except Exception:
+            state = None
     from playwright.async_api import async_playwright
     if pw is None:
         pw = await async_playwright().start()
@@ -209,7 +216,8 @@ async def launch_browser():
         pass
     browser = await pw.chromium.launch(
         headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-    ctx = await browser.new_context(**pw.devices["Pixel 7"])   # layout was captured on mobile
+    extra = {"storage_state": state} if state else {}
+    ctx = await browser.new_context(**pw.devices["Pixel 7"], **extra)   # layout was captured on mobile
 
     async def block(route):                                    # save RAM on the free tier
         if route.request.resource_type in ("image", "media", "font"):
@@ -219,7 +227,8 @@ async def launch_browser():
     await ctx.route("**/*", block)
     page = await ctx.new_page()
     S["launches"] += 1
-    log("browser launched")
+    S["launched_at"] = time.time()
+    log("browser recycled" if keep_session else "browser launched")
 
 
 async def alive():
@@ -261,6 +270,8 @@ async def open_dashboard():
     """Open the dashboard and wait until it has really loaded (logging in if the site asks)."""
     if not await alive():
         await launch_browser()
+    elif time.time() - S["launched_at"] > RECYCLE:
+        await launch_browser(keep_session=True)           # fresh browser, same login
     await page.goto(DASH, wait_until="domcontentloaded")
     for _ in range(20):                                   # the site redirects to login a moment late
         await page.wait_for_timeout(1000)
@@ -325,13 +336,23 @@ async def holdings():
 
 async def open_token(sym):
     await open_dashboard()
-    loc = page.get_by_text(re.compile(rf"[\d.,]+\s*{re.escape(sym)}", re.I)).first
-    await loc.evaluate("e => e.scrollIntoView({block: 'start'})")   # keep it away from the chat bubble
-    try:
-        await loc.click(timeout=5000)
-    except Exception:
-        await loc.dispatch_event("click")          # works even when something covers the row
-    await page.get_by_text("Pending Orders", exact=True).wait_for(timeout=10000)
+    pat = re.compile(rf"[\d.,]+\s*{re.escape(sym)}", re.I)
+    last = None
+    for _ in range(3):
+        try:
+            loc = page.get_by_text(pat).first
+            await loc.evaluate("e => e.scrollIntoView({block: 'start'})", timeout=8000)
+            try:
+                await loc.click(timeout=4000)
+            except Exception:
+                await loc.dispatch_event("click")          # works even when something covers the row
+            await page.locator('[role="dialog"]:visible').first.wait_for(timeout=8000)
+            await page.get_by_text("Pending Orders", exact=True).first.wait_for(timeout=6000)
+            return
+        except Exception as e:
+            last = e
+            await asyncio.sleep(1.5)
+    raise last
 
 
 async def read_balance():
@@ -547,8 +568,15 @@ async def manage(h):
                         return "closed"
                     try:
                         await open_token(sym)
+                        S["tok_fail"] = 0
                     except Exception as e:
-                        log(f"couldn't reopen the token page ({e}); using the dashboard value as the price", "warn")
+                        S["tok_fail"] += 1
+                        n = S["tok_fail"]
+                        if n in (1, 5) or n % 20 == 0:
+                            log(f"couldn't reopen the token page (x{n} in a row): {str(e)[:120]}. "
+                                f"Using the dashboard value as the price.", "warn")
+                        if n == 1:
+                            await shot("token page won't open")
                         v = mine[0].get("value")
                         if v and qty > 0:
                             S["live"]["price"], S["live"]["updated"] = v / qty, time.time()
