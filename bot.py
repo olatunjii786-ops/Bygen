@@ -66,7 +66,7 @@ CATCHUP_MIN = int(E.get("CATCHUP_MINUTES", "20"))     # after a restart, still a
 PORT = int(E.get("PORT", "10000"))
 DASH = "https://bygens.app/dashboard"
 NAIRA = r"₦\s*([\d,]+(?:\.\d+)?)"
-USED_FILE = "/tmp/used_orders.json"
+USED_FILE = "/tmp/used_orders_live.json"        # only REAL (live) orders are remembered across restarts
 
 # ------------------------------------------------------------------ shared state (shown in the UI)
 S = {"status": "starting", "paused": False, "busy": False, "trade": None, "live": None,
@@ -100,6 +100,7 @@ try:
     used = set(json.load(open(USED_FILE)))
 except Exception:
     used = set()
+used_dry = set()                                       # dry-run orders: forgotten on restart
 
 
 class Fatal(Exception):
@@ -718,7 +719,10 @@ def handle_text(text, src="live"):
     if not p:
         return
     oid, parts = p
-    if oid in used:
+    ids = used_dry if DRY_RUN else used
+    if oid in ids:
+        if src != "live":
+            log(f"Order {oid[:8]} was already handled, ignored", "info")
         return
     ok, header = rank_ok(text)
     if not ok:
@@ -736,19 +740,20 @@ def handle_text(text, src="live"):
     if S["busy"]:
         log(f"Busy or already in a trade: skipped order {oid[:8]}", "warn")
         return
-    used.add(oid)
-    try:
-        json.dump(sorted(used), open(USED_FILE, "w"))
-    except Exception:
-        pass
+    ids.add(oid)
+    if not DRY_RUN:
+        try:
+            json.dump(sorted(used), open(USED_FILE, "w"))
+        except Exception:
+            pass
     S["busy"] = True
     log(f"New call ({src}): order {oid[:8]}")
     queue.put_nowait(("call", oid))
 
 
-async def catchup():
-    async for m in client.iter_messages(CHAN, limit=10):          # newest first
-        if m.text and datetime.now(timezone.utc) - m.date < timedelta(minutes=CATCHUP_MIN):
+async def catchup(minutes=None):
+    async for m in client.iter_messages(CHAN, limit=15):          # newest first
+        if m.text and datetime.now(timezone.utc) - m.date < timedelta(minutes=minutes or CATCHUP_MIN):
             handle_text(m.text, "catch-up")
             if S["busy"]:
                 break
@@ -876,7 +881,7 @@ details{border-top:1px solid var(--line);padding:8px 0}summary{cursor:pointer}
 a{color:var(--blue)}.err{color:var(--bad);margin:6px 0;font-size:13px}
 </style></head><body>
 <div class="card"><span id="pill" class="pill idle">...</span> <span id="badges" class="mut" style="font-size:13px"></span>
-<div style="margin-top:10px"><button id="bpause">Pause</button><button id="brecheck">Re-check account</button><button id="bhands">I'm using the app</button><button id="bsell" class="red">Force sell</button></div></div>
+<div style="margin-top:10px"><button id="bpause">Pause</button><button id="brecheck">Re-check account</button><button id="bscan">Re-scan channel</button><button id="bhands">I'm using the app</button><button id="bsell" class="red">Force sell</button></div></div>
 <div class="card" id="tgcard" style="display:none"></div>
 <div class="card"><h2>Stop-loss</h2><div class="mut" id="slnow" style="margin-bottom:6px"></div>
 <input id="slin" type="number" inputmode="numeric" placeholder="Sell if my position falls to ₦ (e.g. 2000)" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px;border:1px solid var(--line);background:#0b0d10;color:var(--tx);font-size:15px">
@@ -939,6 +944,7 @@ async function tick(){try{render(await api('/api/state'))}catch(e){$('#pill').te
 $('#slsave').onclick=()=>saveStop(parseFloat($('#slin').value||0));
 $('#sloff').onclick=()=>{$('#slin').value='';saveStop(0)};
 $('#bhands').onclick=async()=>{await fetch('/api/handsoff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:!(last&&last.hands_off)})});tick()};
+$('#bscan').onclick=async()=>{await api('/api/rescan',true);tick()};
 $('#bpause').onclick=async()=>{await api(last&&last.paused?'/api/resume':'/api/pause',true);tick()};
 $('#brecheck').onclick=async()=>{await api('/api/recheck',true);tick()};
 $('#bsell').onclick=async()=>{if(confirm('Cancel the auto-sell and sell everything now?')){await api('/api/sell',true);tick()}};
@@ -1046,6 +1052,14 @@ def build_app():
             await start_listening()
         return web.json_response({"ok": True})
 
+    async def rescan(_):
+        if S["busy"] or S["trade"] or not tg_ready.is_set():
+            log("Re-scan ignored: bot is busy, holding a trade, or Telegram isn't ready", "warn")
+        else:
+            log("Re-scanning the channel (last 60 minutes)...")
+            asyncio.create_task(catchup(60))
+        return web.json_response({"ok": True})
+
     async def handsoff(request):
         on = bool((await jbody(request)).get("on"))
         S["hands_off"] = on
@@ -1084,7 +1098,7 @@ def build_app():
     app = web.Application(middlewares=[auth])
     app.add_routes([web.get("/", index), web.get("/health", index), web.get("/api/state", state),
                     web.post("/api/pause", pause), web.post("/api/resume", resume),
-                    web.post("/api/sell", sell), web.post("/api/recheck", recheck), web.post("/api/stop", set_stop), web.post("/api/handsoff", handsoff),
+                    web.post("/api/sell", sell), web.post("/api/recheck", recheck), web.post("/api/stop", set_stop), web.post("/api/handsoff", handsoff), web.post("/api/rescan", rescan),
                     web.post("/api/tg/phone", tg_phone), web.post("/api/tg/code", tg_code),
                     web.post("/api/tg/password", tg_password), web.post("/api/tg/retry", tg_retry),
                     web.get("/shot/{i}", get_shot)])
