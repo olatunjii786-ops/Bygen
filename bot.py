@@ -55,6 +55,7 @@ DRY_RUN = E.get("DRY_RUN", "1") == "1"
 MAX_STAKE = float(E.get("MAX_STAKE", "0"))            # 0 = full balance
 MIN_STAKE = 1000.0
 STOP_LOSS_PCT = float(E.get("STOP_LOSS_PCT", "3"))
+MY_RANK = E.get("MY_RANK", "IRON").strip()               # only act on calls whose header names this rank
 REFRESH = float(E.get("REFRESH_SECONDS", "45"))      # how often the watch re-checks the real dashboard
 IDLE_CHECK = float(E.get("IDLE_CHECK_SECONDS", "600"))
 STOP_VALUE = float(E.get("STOP_VALUE", "0"))          # >0: sell only when the position is worth this much (₦)
@@ -373,11 +374,20 @@ async def process_call(order_id):
         await do(run, "Enter order ID and load it", s_load)
 
         async def s_read(st):
-            text = await sheet_text()
+            mx, text = 0.0, ""
+            for _ in range(10):                      # the sheet can show ₦0 for a moment before the balance loads
+                text = await sheet_text()
+                mx = num(re.findall(NAIRA, text.split("How much NGN", 1)[-1])[-1])
+                if mx > 0:
+                    break
+                await asyncio.sleep(1)
+            if mx <= 0 and S["balance"]:
+                mx = S["balance"]                    # fall back to the balance read from the dashboard
+                st.note("sheet still showed ₦0, using the dashboard balance")
+            ctxd["max"] = mx
             ctxd["price"] = num(re.search(r"Current Price:\s*" + NAIRA, text).group(1))
             after = text.split("copy a take profit trade", 1)[-1].strip().splitlines()
             ctxd["symbol"] = after[0].strip()
-            ctxd["max"] = num(re.findall(NAIRA, text.split("How much NGN", 1)[-1])[-1])
             st.note(f"{ctxd['symbol']} at ₦{ctxd['price']}, available ₦{ctxd['max']}")
         await do(run, "Read token, price and balance", s_read)
 
@@ -696,12 +706,23 @@ def date_ok(parts):
         return False
 
 
+def rank_ok(text):
+    """True if the call's header line (e.g. 'IRON AND ABOVE CALL FOR TODAY') names my rank."""
+    m = re.search(r"^.*CALL\s+FOR\s+TODAY.*$", text, re.I | re.M)
+    line = m.group(0).strip() if m else ""
+    return bool(re.search(rf"\b{re.escape(MY_RANK)}\b", line, re.I)), line
+
+
 def handle_text(text, src="live"):
     p = parse_call(text or "")
     if not p:
         return
     oid, parts = p
     if oid in used:
+        return
+    ok, header = rank_ok(text)
+    if not ok:
+        log(f"Skipped order {oid[:8]}: header \"{header or 'not found'}\" is not for rank {MY_RANK}", "warn")
         return
     if not date_ok(parts):
         log(f"Ignored order {oid[:8]} ({src}): call date {parts} is not an allowed date", "warn")
@@ -895,7 +916,7 @@ async function saveStop(v){const r=await fetch('/api/stop',{method:'POST',header
  const d=await r.json();const m=$('#slmsg');m.className=d.ok?'mut':'err';m.textContent=d.ok?'Saved.':d.error;tick()}
 function render(s){last=s;renderTg(s);renderSl(s);const p=$('#pill');p.textContent=s.status.toUpperCase();
  p.className='pill '+(s.status==='error'?'bad':s.status==='idle'?'idle':s.status==='selling'?'warn':'ok');
- $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · stop-loss '+s.sl+' · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg)+(s.balance!==null?' · Balance ₦'+s.balance.toFixed(2)+' ('+fmt(s.balance_age)+' ago)':'')+(s.hands_off?' · HANDS OFF':'');
+ $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · rank '+s.rank+' · stop-loss '+s.sl+' · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg)+(s.balance!==null?' · Balance ₦'+s.balance.toFixed(2)+' ('+fmt(s.balance_age)+' ago)':'')+(s.hands_off?' · HANDS OFF':'');
  $('#bhands').textContent=s.hands_off?'Resume bot (I am done)':'I\'m using the app';
  $('#bpause').textContent=s.paused?'Resume':'Pause';
  const pos=$('#pos');pos.replaceChildren();const t=s.trade,L=s.live;
@@ -958,7 +979,7 @@ def build_app():
             "uptime": time.time() - S["started"], "trade": S["trade"], "live": L,
             "hands_off": S["hands_off"], "balance": S["balance"],
             "balance_age": (time.time() - S["balance_t"]) if S["balance_t"] else None,
-            "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
+            "rank": MY_RANK, "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
             "runs": list(RUNS), "logs": list(LOGS)[-80:][::-1],
             "shots": [{k: v for k, v in s.items() if k != "data"} for s in SHOTS]})
 
