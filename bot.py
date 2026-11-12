@@ -71,7 +71,7 @@ USED_FILE = "/tmp/used_orders_live.json"        # only REAL (live) orders are re
 # ------------------------------------------------------------------ shared state (shown in the UI)
 S = {"status": "starting", "paused": False, "busy": False, "trade": None, "live": None,
      "started": time.time(), "tg": "connecting", "tg_err": "", "tg_session": None, "channel": None,
-     "hands_off": False, "balance": None, "balance_t": None, "logins": 0}
+     "hands_off": False, "balance": None, "balance_t": None, "logins": 0, "launches": 0}
 try:                                                      # dashboard value survives soft restarts
     S["stop_value"] = float(json.load(open(SETTINGS_FILE))["stop_value"])
 except Exception:
@@ -218,6 +218,7 @@ async def launch_browser():
             await route.continue_()
     await ctx.route("**/*", block)
     page = await ctx.new_page()
+    S["launches"] += 1
     log("browser launched")
 
 
@@ -281,14 +282,15 @@ async def open_dashboard():
     log("logged in")
 
 
-HOLD_RE = re.compile(r"([\d,]*\.?\d+)\s+([A-Za-z0-9$]+)\s*\(\s*([\d,]*\.?\d+)\s*\+\s*([\d,]*\.?\d+)\s*locked\s*\)")
+HOLD_RE = re.compile(r"([\d,]*\.?\d+)\s+([A-Za-z0-9$]+)\s*\(\s*([\d,]*\.?\d+)\s*\+\s*([\d,]*\.?\d+)\s*locked\s*\)(?:\s*₦\s*([\d,]+(?:\.\d+)?))?")
 HOLD_RE2 = re.compile(r"^\s*([\d,]*\.?\d+)\s+([A-Z][A-Z0-9$]+)\s*$", re.M)
 
 
 def parse_holdings(body):
-    hs = [{"symbol": m[1], "avail": num(m[2]), "locked": num(m[3])} for m in HOLD_RE.findall(body)]
+    hs = [{"symbol": m[1], "avail": num(m[2]), "locked": num(m[3]), "value": num(m[4]) if m[4] else None}
+          for m in HOLD_RE.findall(body)]
     if not hs:
-        hs = [{"symbol": m[1], "avail": num(m[0]), "locked": 0.0} for m in HOLD_RE2.findall(body)]
+        hs = [{"symbol": m[1], "avail": num(m[0]), "locked": 0.0, "value": None} for m in HOLD_RE2.findall(body)]
     return hs
 
 
@@ -323,7 +325,12 @@ async def holdings():
 
 async def open_token(sym):
     await open_dashboard()
-    await page.get_by_text(re.compile(rf"[\d.,]+\s*{re.escape(sym)}", re.I)).first.click()
+    loc = page.get_by_text(re.compile(rf"[\d.,]+\s*{re.escape(sym)}", re.I)).first
+    await loc.evaluate("e => e.scrollIntoView({block: 'start'})")   # keep it away from the chat bubble
+    try:
+        await loc.click(timeout=5000)
+    except Exception:
+        await loc.dispatch_event("click")          # works even when something covers the row
     await page.get_by_text("Pending Orders", exact=True).wait_for(timeout=10000)
 
 
@@ -525,15 +532,29 @@ async def manage(h):
             try:
                 if time.time() >= next_refresh or S.pop("force_refresh", False):
                     next_refresh = time.time() + REFRESH
-                    n0 = S["logins"]
+                    n0, l0 = S["logins"], S["launches"]
                     hs = await holdings()                        # reloads dashboard; logs in again if kicked out
                     S["live"]["verified"] = time.time()
                     if S["logins"] != n0:
-                        await notify("The site had logged the bot out (you logged in elsewhere?). Logged back in. "
-                                     "Note: this logs you out of the app on your other devices.")
-                    if not [x for x in hs if x["symbol"].lower() == sym.lower()]:
+                        if S["launches"] != l0:
+                            await notify("The bot's browser had crashed (probably out of memory on the free plan). "
+                                         "Restarted it and logged in again.")
+                        else:
+                            await notify("The site had logged the bot out (you logged in elsewhere?). Logged back in. "
+                                         "Note: this logs you out of the app on your other devices.")
+                    mine = [x for x in hs if x["symbol"].lower() == sym.lower()]
+                    if not mine:
                         return "closed"
-                    await open_token(sym)
+                    try:
+                        await open_token(sym)
+                    except Exception as e:
+                        log(f"couldn't reopen the token page ({e}); using the dashboard value as the price", "warn")
+                        v = mine[0].get("value")
+                        if v and qty > 0:
+                            S["live"]["price"], S["live"]["updated"] = v / qty, time.time()
+                            if mode["floor"] and v / qty <= mode["floor"]:
+                                return f"stop-loss (dashboard value): ₦{v / qty:.2f} <= ₦{mode['floor']:.2f}"
+                        continue
                 txt = await sheet_text()
                 price = num(re.search(NAIRA, txt).group(1))
                 L = S["live"]
