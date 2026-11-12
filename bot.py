@@ -715,7 +715,8 @@ def rank_ok(text):
 
 
 def handle_text(text, src="live"):
-    p = parse_call(text or "")
+    text = re.sub(r"[*_`~]", "", text or "")              # ignore bold/italic markers
+    p = parse_call(text)
     if not p:
         return
     oid, parts = p
@@ -752,11 +753,20 @@ def handle_text(text, src="live"):
 
 
 async def catchup(minutes=None):
-    async for m in client.iter_messages(CHAN, limit=15):          # newest first
-        if m.text and datetime.now(timezone.utc) - m.date < timedelta(minutes=minutes or CATCHUP_MIN):
-            handle_text(m.text, "catch-up")
-            if S["busy"]:
-                break
+    win = minutes or CATCHUP_MIN
+    seen = recent = 0
+    try:
+        async for m in client.iter_messages(CHAN, limit=15):          # newest first
+            seen += 1
+            txt = m.raw_text or ""
+            if txt and datetime.now(timezone.utc) - m.date < timedelta(minutes=win):
+                recent += 1
+                handle_text(txt, "catch-up")
+                if S["busy"]:
+                    break
+        log(f"Channel scan: read {seen} messages, {recent} within the last {win} min.")
+    except Exception as e:
+        log(f"Channel scan failed: {e}", "error")
 
 
 async def idle_loop():
