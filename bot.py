@@ -55,6 +55,8 @@ DRY_RUN = E.get("DRY_RUN", "1") == "1"
 MAX_STAKE = float(E.get("MAX_STAKE", "0"))            # 0 = full balance
 MIN_STAKE = 1000.0
 STOP_LOSS_PCT = float(E.get("STOP_LOSS_PCT", "3"))
+REFRESH = float(E.get("REFRESH_SECONDS", "45"))      # how often the watch re-checks the real dashboard
+IDLE_CHECK = float(E.get("IDLE_CHECK_SECONDS", "600"))
 STOP_VALUE = float(E.get("STOP_VALUE", "0"))          # >0: sell only when the position is worth this much (₦)
 SETTINGS_FILE = "/tmp/settings.json"
 POLL = float(E.get("POLL_SECONDS", "2"))
@@ -67,7 +69,8 @@ USED_FILE = "/tmp/used_orders.json"
 
 # ------------------------------------------------------------------ shared state (shown in the UI)
 S = {"status": "starting", "paused": False, "busy": False, "trade": None, "live": None,
-     "started": time.time(), "tg": "connecting", "tg_err": "", "tg_session": None, "channel": None}
+     "started": time.time(), "tg": "connecting", "tg_err": "", "tg_session": None, "channel": None,
+     "hands_off": False, "balance": None, "balance_t": None, "logins": 0}
 try:                                                      # dashboard value survives soft restarts
     S["stop_value"] = float(json.load(open(SETTINGS_FILE))["stop_value"])
 except Exception:
@@ -136,9 +139,10 @@ def num(s):
 
 
 # ------------------------------------------------------------------ step tracking
-def new_run(title):
+def new_run(title, record=True):
     r = {"id": next(_ids), "title": title, "t": now_s(), "status": "running", "steps": []}
-    RUNS.appendleft(r)
+    if record:
+        RUNS.appendleft(r)
     return r
 
 
@@ -271,6 +275,7 @@ async def open_dashboard():
     await page.get_by_role("button", name="Sign in").click()
     await page.wait_for_url("**/dashboard**", timeout=20000)
     await page.get_by_text("Total Balance").first.wait_for(timeout=15000)
+    S["logins"] += 1
     log("logged in")
 
 
@@ -285,12 +290,23 @@ def parse_holdings(body):
     return hs
 
 
+def parse_balance(body):
+    m = re.search(r"Total Balance\s*₦\s*([\d,]+\s*\.?\s*\d*)", body)
+    try:
+        return num(re.sub(r"\s", "", m.group(1))) if m else None
+    except Exception:
+        return None
+
+
 async def holdings():
     """Ground truth from the dashboard: list of tokens we hold. [] = nothing."""
     await open_dashboard()
     empty_seen = 0
     for _ in range(12):
         body = await page.locator("body").inner_text()
+        b = parse_balance(body)
+        if b is not None:
+            S["balance"], S["balance_t"] = b, time.time()
         if "No token holdings yet" in body:
             empty_seen += 1                       # must be seen twice: guards against a half-loaded page
             if empty_seen >= 2:
@@ -310,13 +326,15 @@ async def open_token(sym):
 
 
 async def read_balance():
+    """Fresh balance as a float, or None if it couldn't be read."""
     try:
         await open_dashboard()
-        body = await page.locator("body").inner_text()
-        m = re.search(r"Total Balance\s*₦\s*([\d,]+\s*\.?\s*\d*)", body)
-        return re.sub(r"\s", "", m.group(1)) if m else "?"
+        b = parse_balance(await page.locator("body").inner_text())
+        if b is not None:
+            S["balance"], S["balance_t"] = b, time.time()
+        return b
     except Exception:
-        return "?"
+        return None
 
 
 # ------------------------------------------------------------------ BUY
@@ -450,20 +468,39 @@ async def manage(h):
         st.note(f"Trade pre-dates the bot, so ₦{price} (price now) is used as the entry for the stop-loss")
     await do(run, "Record entry price", s_base)
 
+    bal0 = S["balance"]
+
     async def watch(st):
         qty = h["avail"] + h["locked"]
         S["qty"] = qty
         mode = {"v": None, "floor": None}
-        S["live"] = {"price": None, "floor": None, "updated": None, "changed": time.time()}
+        S["live"] = {"price": None, "floor": None, "updated": None, "changed": time.time(),
+                     "verified": time.time(), "handsoff": False}
         last, closed, errs = None, 0, 0
+        next_refresh = time.time() + REFRESH
         while True:
             if force.is_set():
                 return "manual"
+            if S["hands_off"]:                                   # you're using the app: don't touch the site
+                S["live"]["handsoff"] = True
+                await asyncio.sleep(POLL)
+                continue
             try:
+                if time.time() >= next_refresh or S.pop("force_refresh", False):
+                    next_refresh = time.time() + REFRESH
+                    n0 = S["logins"]
+                    hs = await holdings()                        # reloads dashboard; logs in again if kicked out
+                    S["live"]["verified"] = time.time()
+                    if S["logins"] != n0:
+                        await notify("The site had logged the bot out (you logged in elsewhere?). Logged back in. "
+                                     "Note: this logs you out of the app on your other devices.")
+                    if not [x for x in hs if x["symbol"].lower() == sym.lower()]:
+                        return "closed"
+                    await open_token(sym)
                 txt = await sheet_text()
                 price = num(re.search(NAIRA, txt).group(1))
                 L = S["live"]
-                L["price"], L["updated"] = price, time.time()
+                L["price"], L["updated"], L["handsoff"] = price, time.time(), False
                 if price != last:
                     L["changed"], last = time.time(), price
                 errs = 0
@@ -504,7 +541,16 @@ async def manage(h):
     S["live"] = None
     if reason == "closed":
         S["trade"], S["status"] = None, "idle"
-        await notify(f"{sym} position closed (take-profit filled or sold). Balance: ₦{await read_balance()}")
+        b1 = await read_balance()
+        msg = f"{sym} position is closed (take-profit filled or sold)."
+        if b1 is not None and bal0 is not None:
+            d = b1 - bal0
+            msg += f" Balance ₦{b1:,.2f} (was ₦{bal0:,.2f}, {d:+,.2f})."
+            if t and t.get("stake"):
+                msg += f" About ₦{d - t['stake']:+,.2f} compared with your ₦{t['stake']} stake."
+        elif b1 is not None:
+            msg += f" Balance ₦{b1:,.2f}."
+        await notify(msg)
         return
     ok = await exit_position(sym, reason)
     S["trade"] = None
@@ -521,7 +567,8 @@ async def exit_position(sym, reason):
         try:
             await sell_steps(run, sym)
             finish(run)
-            await notify(f"SOLD {sym}. Balance: ₦{await read_balance()}")
+            b1 = await read_balance()
+            await notify(f"SOLD {sym}. Balance: " + (f"₦{b1:,.2f}" if b1 is not None else "?"))
             return True
         except Exception as e:
             run["status"] = "failed"
@@ -606,7 +653,8 @@ async def sell_steps(run, sym):
 
 # ------------------------------------------------------------------ RECONCILE (resume from real state)
 async def reconcile(why):
-    run = new_run(f"Check account state ({why})")
+    quiet = why == "periodic check"
+    run = new_run(f"Check account state ({why})", record=not quiet)
     try:
         async def s(st):
             hs = await holdings()
@@ -622,6 +670,8 @@ async def reconcile(why):
             S["trade"], S["status"] = None, "idle"
     except Exception as e:
         run["status"] = "failed"
+        if quiet:
+            RUNS.appendleft(run)
         S["status"] = "error"
         log(f"reconcile failed: {e}", "error")
 
@@ -659,6 +709,9 @@ def handle_text(text, src="live"):
     if S["paused"]:
         log(f"Paused: skipped order {oid[:8]}", "warn")
         return
+    if S["hands_off"]:
+        log(f"Hands-off mode is ON: skipped order {oid[:8]}", "warn")
+        return
     if S["busy"]:
         log(f"Busy or already in a trade: skipped order {oid[:8]}", "warn")
         return
@@ -678,6 +731,15 @@ async def catchup():
             handle_text(m.text, "catch-up")
             if S["busy"]:
                 break
+
+
+async def idle_loop():
+    """While idle, re-check the account now and then (keeps balance fresh and the login alive)."""
+    while True:
+        await asyncio.sleep(IDLE_CHECK)
+        if tg_ready.is_set() and not S["busy"] and not S["hands_off"] and queue.empty():
+            S["busy"] = True
+            queue.put_nowait(("reconcile", "periodic check"))
 
 
 async def worker():
@@ -793,7 +855,7 @@ details{border-top:1px solid var(--line);padding:8px 0}summary{cursor:pointer}
 a{color:var(--blue)}.err{color:var(--bad);margin:6px 0;font-size:13px}
 </style></head><body>
 <div class="card"><span id="pill" class="pill idle">...</span> <span id="badges" class="mut" style="font-size:13px"></span>
-<div style="margin-top:10px"><button id="bpause">Pause</button><button id="brecheck">Re-check account</button><button id="bsell" class="red">Force sell</button></div></div>
+<div style="margin-top:10px"><button id="bpause">Pause</button><button id="brecheck">Re-check account</button><button id="bhands">I'm using the app</button><button id="bsell" class="red">Force sell</button></div></div>
 <div class="card" id="tgcard" style="display:none"></div>
 <div class="card"><h2>Stop-loss</h2><div class="mut" id="slnow" style="margin-bottom:6px"></div>
 <input id="slin" type="number" inputmode="numeric" placeholder="Sell if my position falls to ₦ (e.g. 2000)" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px;border:1px solid var(--line);background:#0b0d10;color:var(--tx);font-size:15px">
@@ -833,14 +895,15 @@ async function saveStop(v){const r=await fetch('/api/stop',{method:'POST',header
  const d=await r.json();const m=$('#slmsg');m.className=d.ok?'mut':'err';m.textContent=d.ok?'Saved.':d.error;tick()}
 function render(s){last=s;renderTg(s);renderSl(s);const p=$('#pill');p.textContent=s.status.toUpperCase();
  p.className='pill '+(s.status==='error'?'bad':s.status==='idle'?'idle':s.status==='selling'?'warn':'ok');
- $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · stop-loss '+s.sl+' · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg);
+ $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · stop-loss '+s.sl+' · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg)+(s.balance!==null?' · Balance ₦'+s.balance.toFixed(2)+' ('+fmt(s.balance_age)+' ago)':'')+(s.hands_off?' · HANDS OFF':'');
+ $('#bhands').textContent=s.hands_off?'Resume bot (I am done)':'I\'m using the app';
  $('#bpause').textContent=s.paused?'Resume':'Pause';
  const pos=$('#pos');pos.replaceChildren();const t=s.trade,L=s.live;
  if(!t){pos.append(el('div','mut','No open position'))}else{
   pos.append(kv('Token',t.symbol),kv('Stake',t.stake?'₦'+t.stake:'(opened before bot)'),kv('Entry','₦'+t.entry+(t.baseline?' (baseline)':'')));
   if(L&&L.price!==null){const dp=((L.price/t.entry-1)*100).toFixed(2);
    pos.append(kv('Price now','₦'+L.price+' ('+dp+'%)',dp<0?'color:var(--bad)':''),kv('Stop-loss at','₦'+L.floor.toFixed(2)),
-   kv('Price last changed',fmt(L.changed_ago)+' ago',L.changed_ago>600?'color:var(--warn)':''),kv('Last read',fmt(L.updated_ago)+' ago'))}}
+   kv('Price last changed',fmt(L.changed_ago)+' ago',L.changed_ago>600?'color:var(--warn)':''),kv('Checked on the site',fmt(L.verified_ago)+' ago',L.verified_ago>180?'color:var(--warn)':''))}}
  const runs=$('#runs');runs.replaceChildren();
  s.runs.forEach(r=>{if(!seen.has(r.id)){seen.add(r.id);if(r.status!=='ok')openIds.add(r.id)}
   const d=el('details');d.open=openIds.has(r.id);d.addEventListener('toggle',()=>{d.open?openIds.add(r.id):openIds.delete(r.id)});
@@ -854,6 +917,7 @@ function render(s){last=s;renderTg(s);renderSl(s);const p=$('#pill');p.textConte
 async function tick(){try{render(await api('/api/state'))}catch(e){$('#pill').textContent='OFFLINE';$('#pill').className='pill bad'}}
 $('#slsave').onclick=()=>saveStop(parseFloat($('#slin').value||0));
 $('#sloff').onclick=()=>{$('#slin').value='';saveStop(0)};
+$('#bhands').onclick=async()=>{await fetch('/api/handsoff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:!(last&&last.hands_off)})});tick()};
 $('#bpause').onclick=async()=>{await api(last&&last.paused?'/api/resume':'/api/pause',true);tick()};
 $('#brecheck').onclick=async()=>{await api('/api/recheck',true);tick()};
 $('#bsell').onclick=async()=>{if(confirm('Cancel the auto-sell and sell everything now?')){await api('/api/sell',true);tick()}};
@@ -887,10 +951,13 @@ def build_app():
         if L:
             L["changed_ago"] = time.time() - L["changed"]
             L["updated_ago"] = time.time() - (L["updated"] or time.time())
+            L["verified_ago"] = time.time() - L.get("verified", time.time())
         return web.json_response({
             "status": S["status"], "paused": S["paused"], "dry": DRY_RUN, "sl": stop_label(), "stop_value": S["stop_value"], "pct": STOP_LOSS_PCT,
             "pos_value": (S["qty"] * L["price"]) if (L and L.get("price")) else None,
             "uptime": time.time() - S["started"], "trade": S["trade"], "live": L,
+            "hands_off": S["hands_off"], "balance": S["balance"],
+            "balance_age": (time.time() - S["balance_t"]) if S["balance_t"] else None,
             "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
             "runs": list(RUNS), "logs": list(LOGS)[-80:][::-1],
             "shots": [{k: v for k, v in s.items() if k != "data"} for s in SHOTS]})
@@ -958,6 +1025,14 @@ def build_app():
             await start_listening()
         return web.json_response({"ok": True})
 
+    async def handsoff(request):
+        on = bool((await jbody(request)).get("on"))
+        S["hands_off"] = on
+        if not on:
+            S["force_refresh"] = True
+        log("Hands-off ON: the bot won't touch the site" if on else "Hands-off OFF: the bot resumes", "notify")
+        return web.json_response({"ok": True})
+
     async def set_stop(request):
         try:
             v = float((await jbody(request)).get("value") or 0)
@@ -988,7 +1063,7 @@ def build_app():
     app = web.Application(middlewares=[auth])
     app.add_routes([web.get("/", index), web.get("/health", index), web.get("/api/state", state),
                     web.post("/api/pause", pause), web.post("/api/resume", resume),
-                    web.post("/api/sell", sell), web.post("/api/recheck", recheck), web.post("/api/stop", set_stop),
+                    web.post("/api/sell", sell), web.post("/api/recheck", recheck), web.post("/api/stop", set_stop), web.post("/api/handsoff", handsoff),
                     web.post("/api/tg/phone", tg_phone), web.post("/api/tg/code", tg_code),
                     web.post("/api/tg/password", tg_password), web.post("/api/tg/retry", tg_retry),
                     web.get("/shot/{i}", get_shot)])
@@ -1005,6 +1080,7 @@ async def main():
     await launch_browser()
     await client.connect()
     asyncio.create_task(worker())
+    asyncio.create_task(idle_loop())
     if await client.is_user_authorized():
         await start_listening()
     else:
