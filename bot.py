@@ -412,6 +412,14 @@ async def process_call(order_id):
                 st.note("typed input failed, used slider at 100%")
             else:
                 st.note(f"typed ₦{stake}")
+            try:                                             # remember the take-profit target for the dashboard
+                await asyncio.sleep(0.8)
+                tp_in = await page.locator("input:visible").first.input_value()
+                ctxd["tp_price"] = num(re.sub(r"[^\d.,]", "", tp_in))
+                m = re.search(r"≈\s*₦\s*([\d,]+(?:\.\d+)?)\s*when executed", await sheet_text())
+                ctxd["tp_value"] = num(m.group(1)) if m else None
+            except Exception:
+                pass
         await do(run, "Enter stake amount", s_stake)
 
         async def s_confirm(st):
@@ -443,7 +451,8 @@ async def process_call(order_id):
         h = await do(run, "Verify position opened", s_verify, tries=1)
         finish(run)
         S["trade"] = {"symbol": h["symbol"], "entry": ctxd["price"], "stake": ctxd["stake"],
-                      "opened": now_s(), "baseline": False}
+                      "opened": now_s(), "baseline": False,
+                      "tp_price": ctxd.get("tp_price"), "tp_value": ctxd.get("tp_value")}
         await notify(f"BOUGHT {h['symbol']}: ₦{ctxd['stake']} at ₦{ctxd['price']}. Stop-loss {stop_label()}.")
         await manage(h)
     except Exception as e:
@@ -480,6 +489,23 @@ async def manage(h):
     await do(run, "Record entry price", s_base)
 
     bal0 = S["balance"]
+
+    async def s_tp(st):
+        if t.get("tp_price") and t.get("tp_value"):
+            return st.note(f"target ₦{t['tp_price']}, you'd get about ₦{t['tp_value']}")
+        try:
+            await page.get_by_text("Pending Orders", exact=True).click()
+            await page.wait_for_timeout(1200)
+            txt = await sheet_text()
+            m = re.search(r"Auto-sell.*?₦\s*([\d,]+(?:\.\d+)?)\s*≈\s*₦\s*([\d,]+(?:\.\d+)?)", txt, re.S)
+            if m:
+                t["tp_price"], t["tp_value"] = num(m.group(1)), num(m.group(2))
+                st.note(f"target ₦{t['tp_price']}, you'd get about ₦{t['tp_value']}")
+            else:
+                st.note("couldn't find an auto-sell order (is the take-profit still pending?)")
+        except Exception as e:
+            st.note(f"couldn't read the target: {e}")
+    await do(run, "Read take-profit target", s_tp)
 
     async def watch(st):
         qty = h["avail"] + h["locked"]
@@ -937,8 +963,10 @@ function render(s){last=s;renderTg(s);renderSl(s);const p=$('#pill');p.textConte
  const pos=$('#pos');pos.replaceChildren();const t=s.trade,L=s.live;
  if(!t){pos.append(el('div','mut','No open position'))}else{
   pos.append(kv('Token',t.symbol),kv('Stake',t.stake?'₦'+t.stake:'(opened before bot)'),kv('Entry','₦'+t.entry+(t.baseline?' (baseline)':'')));
+  if(t.tp_price){const g=(t.stake&&t.tp_value)?t.tp_value-t.stake:null;
+   pos.append(kv('Sells at (target)','₦'+t.tp_price),kv('You get at target','₦'+(t.tp_value||'?')+(g!==null?' ('+(g>=0?'+':'')+g.toFixed(2)+')':''),'color:var(--ok)'))}
   if(L&&L.price!==null){const dp=((L.price/t.entry-1)*100).toFixed(2);
-   pos.append(kv('Price now','₦'+L.price+' ('+dp+'%)',dp<0?'color:var(--bad)':''),kv('Stop-loss at','₦'+L.floor.toFixed(2)),
+   pos.append(kv('Price now','₦'+L.price+' ('+dp+'%)',dp<0?'color:var(--bad)':''),kv('Stop-loss at','₦'+L.floor.toFixed(2)+(s.qty?'  (you get ~₦'+(L.floor*s.qty).toFixed(0)+')':'')),
    kv('Price last changed',fmt(L.changed_ago)+' ago',L.changed_ago>600?'color:var(--warn)':''),kv('Checked on the site',fmt(L.verified_ago)+' ago',L.verified_ago>180?'color:var(--warn)':''))}}
  const runs=$('#runs');runs.replaceChildren();
  s.runs.forEach(r=>{if(!seen.has(r.id)){seen.add(r.id);if(r.status!=='ok')openIds.add(r.id)}
@@ -995,7 +1023,7 @@ def build_app():
             "uptime": time.time() - S["started"], "trade": S["trade"], "live": L,
             "hands_off": S["hands_off"], "balance": S["balance"],
             "balance_age": (time.time() - S["balance_t"]) if S["balance_t"] else None,
-            "rank": MY_RANK, "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
+            "rank": MY_RANK, "qty": S["qty"], "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
             "runs": list(RUNS), "logs": list(LOGS)[-80:][::-1],
             "shots": [{k: v for k, v in s.items() if k != "data"} for s in SHOTS]})
 
