@@ -57,6 +57,8 @@ MIN_STAKE = 1000.0
 STOP_LOSS_PCT = float(E.get("STOP_LOSS_PCT", "3"))
 MY_RANK = E.get("MY_RANK", "IRON").strip()               # only act on calls whose header names this rank
 RECYCLE = float(E.get("BROWSER_RECYCLE_MINUTES", "20")) * 60   # restart the browser now and then (free-tier memory)
+MEM_LIMIT = float(E.get("MEM_LIMIT_MB", "512"))
+MEM_RECYCLE = MEM_LIMIT * 0.75                         # restart the browser above this many MB
 REFRESH = float(E.get("REFRESH_SECONDS", "45"))      # how often the watch re-checks the real dashboard
 IDLE_CHECK = float(E.get("IDLE_CHECK_SECONDS", "600"))
 STOP_VALUE = float(E.get("STOP_VALUE", "0"))          # >0: sell only when the position is worth this much (₦)
@@ -110,6 +112,25 @@ class Fatal(Exception):
 
 class StepFailed(Exception):
     pass
+
+
+def mem_mb():
+    """Memory used by this service in MB (cgroup counters), or None if unavailable."""
+    try:
+        cur = int(open("/sys/fs/cgroup/memory.current").read())
+        try:
+            for line in open("/sys/fs/cgroup/memory.stat"):
+                if line.startswith("inactive_file "):
+                    cur -= int(line.split()[1])
+                    break
+        except Exception:
+            pass
+        return cur / 1048576
+    except Exception:
+        try:
+            return int(open("/sys/fs/cgroup/memory/memory.usage_in_bytes").read()) / 1048576
+        except Exception:
+            return None
 
 
 def now_s():
@@ -272,7 +293,10 @@ async def open_dashboard():
     """Open the dashboard and wait until it has really loaded (logging in if the site asks)."""
     if not await alive():
         await launch_browser()
-    elif time.time() - S["launched_at"] > RECYCLE:
+    elif time.time() - S["launched_at"] > RECYCLE or (
+            (mem_mb() or 0) > MEM_RECYCLE and time.time() - S["launched_at"] > 60):
+        if (mem_mb() or 0) > MEM_RECYCLE:
+            log(f"Memory at {mem_mb():.0f} MB: restarting the browser early", "warn")
         await launch_browser(keep_session=True)           # fresh browser, same login
     await page.goto(DASH, wait_until="domcontentloaded")
     for _ in range(20):                                   # the site redirects to login a moment late
@@ -873,6 +897,25 @@ async def idle_loop():
             queue.put_nowait(("reconcile", "periodic check"))
 
 
+async def watchdog():
+    """Tell you on Telegram when the stop-loss can't be trusted (position not verified for 5+ minutes)."""
+    warned = False
+    while True:
+        await asyncio.sleep(60)
+        L, t = S["live"], S["trade"]
+        if t and L and not S["hands_off"]:
+            age = time.time() - L.get("verified", time.time())
+            if age > 300 and not warned:
+                warned = True
+                await notify(f"WARNING: the bot hasn't been able to check your {t['symbol']} position for "
+                             f"{int(age / 60)} min, so the stop-loss may not be protecting you. Check the app.")
+            elif age <= 300 and warned:
+                warned = False
+                await notify("Protection restored: your position was verified again.")
+        else:
+            warned = False
+
+
 async def worker():
     S["busy"] = True
     try:
@@ -1026,7 +1069,7 @@ async function saveStop(v){const r=await fetch('/api/stop',{method:'POST',header
  const d=await r.json();const m=$('#slmsg');m.className=d.ok?'mut':'err';m.textContent=d.ok?'Saved.':d.error;tick()}
 function render(s){last=s;renderTg(s);renderSl(s);const p=$('#pill');p.textContent=s.status.toUpperCase();
  p.className='pill '+(s.status==='error'?'bad':s.status==='idle'?'idle':s.status==='selling'?'warn':'ok');
- $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · rank '+s.rank+' · stop-loss '+s.sl+' · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg)+(s.balance!==null?' · Balance ₦'+s.balance.toFixed(2)+' ('+fmt(s.balance_age)+' ago)':'')+(s.hands_off?' · HANDS OFF':'');
+ $('#badges').textContent=(s.dry?'DRY RUN':'LIVE')+' · rank '+s.rank+' · stop-loss '+s.sl+' · up '+fmt(s.uptime)+(s.paused?' · PAUSED':'')+' · Telegram: '+(s.tg==='ready'?(s.channel||'ready'):s.tg)+(s.balance!==null?' · Balance ₦'+s.balance.toFixed(2)+' ('+fmt(s.balance_age)+' ago)':'')+(s.hands_off?' · HANDS OFF':'')+(s.mem?' · Mem '+Math.round(s.mem)+'MB':'');
  $('#bhands').textContent=s.hands_off?'Resume bot (I am done)':'I\'m using the app';
  $('#bpause').textContent=s.paused?'Resume':'Pause';
  const pos=$('#pos');pos.replaceChildren();const t=s.trade,L=s.live;
@@ -1092,7 +1135,7 @@ def build_app():
             "uptime": time.time() - S["started"], "trade": S["trade"], "live": L,
             "hands_off": S["hands_off"], "balance": S["balance"],
             "balance_age": (time.time() - S["balance_t"]) if S["balance_t"] else None,
-            "rank": MY_RANK, "qty": S["qty"], "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
+            "rank": MY_RANK, "mem": mem_mb(), "qty": S["qty"], "tg": S["tg"], "tg_err": S["tg_err"], "tg_session": S["tg_session"], "channel": S["channel"],
             "runs": list(RUNS), "logs": list(LOGS)[-80:][::-1],
             "shots": [{k: v for k, v in s.items() if k != "data"} for s in SHOTS]})
 
@@ -1223,6 +1266,7 @@ async def main():
     await client.connect()
     asyncio.create_task(worker())
     asyncio.create_task(idle_loop())
+    asyncio.create_task(watchdog())
     if await client.is_user_authorized():
         await start_listening()
     else:
