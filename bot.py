@@ -56,7 +56,7 @@ MAX_STAKE = float(E.get("MAX_STAKE", "0"))            # 0 = full balance
 MIN_STAKE = 1000.0
 STOP_LOSS_PCT = float(E.get("STOP_LOSS_PCT", "3"))
 MY_RANK = E.get("MY_RANK", "IRON").strip()               # only act on calls whose header names this rank
-RECYCLE = float(E.get("BROWSER_RECYCLE_MINUTES", "30")) * 60   # restart the browser now and then (free-tier memory)
+RECYCLE = float(E.get("BROWSER_RECYCLE_MINUTES", "20")) * 60   # restart the browser now and then (free-tier memory)
 REFRESH = float(E.get("REFRESH_SECONDS", "45"))      # how often the watch re-checks the real dashboard
 IDLE_CHECK = float(E.get("IDLE_CHECK_SECONDS", "600"))
 STOP_VALUE = float(E.get("STOP_VALUE", "0"))          # >0: sell only when the position is worth this much (₦)
@@ -215,7 +215,9 @@ async def launch_browser(keep_session=False):
     except Exception:
         pass
     browser = await pw.chromium.launch(
-        headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                             "--renderer-process-limit=1", "--disable-extensions",
+                             "--disable-background-networking", "--mute-audio"])
     extra = {"storage_state": state} if state else {}
     ctx = await browser.new_context(**pw.devices["Pixel 7"], **extra)   # layout was captured on mobile
 
