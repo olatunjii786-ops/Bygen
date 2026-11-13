@@ -326,7 +326,7 @@ async def holdings():
             S["balance"], S["balance_t"] = b, time.time()
         if "No token holdings yet" in body:
             empty_seen += 1                       # must be seen twice: guards against a half-loaded page
-            if empty_seen >= 2:
+            if empty_seen >= 4:
                 return []
         else:
             hs = parse_holdings(body)
@@ -334,6 +334,20 @@ async def holdings():
                 return hs
         await asyncio.sleep(1.2)
     raise RuntimeError("couldn't read holdings from dashboard")
+
+
+async def verified_closed(sym, bal0, pos_val):
+    """True only if the token is really gone AND the balance rose by roughly the position's value."""
+    await asyncio.sleep(5)
+    hs = await holdings()
+    if [x for x in hs if x["symbol"].lower() == sym.lower()]:
+        return False
+    b = S["balance"]
+    if bal0 is not None and b is not None and pos_val and (b - bal0) < 0.8 * pos_val:
+        log("Dashboard shows no holdings but the balance didn't rise: probably a half-loaded page, "
+            "still watching.", "warn")
+        return False
+    return True
 
 
 async def open_token(sym):
@@ -567,7 +581,9 @@ async def manage(h):
                                          "Note: this logs you out of the app on your other devices.")
                     mine = [x for x in hs if x["symbol"].lower() == sym.lower()]
                     if not mine:
-                        return "closed"
+                        if await verified_closed(sym, bal0, (S["live"].get("price") or 0) * qty):
+                            return "closed"
+                        mine = [{}]                              # false alarm: carry on watching
                     try:
                         await open_token(sym)
                         S["tok_fail"] = 0
@@ -618,7 +634,9 @@ async def manage(h):
                     log(f"watch read errors x{errs}: {e}", "warn")
                 if errs % 5 == 0:
                     try:
-                        if not await holdings():
+                        hs = await holdings()
+                        if not [x for x in hs if x["symbol"].lower() == sym.lower()] and \
+                                await verified_closed(sym, bal0, (S["live"].get("price") or 0) * qty):
                             return "closed"
                         await open_token(sym)
                     except Exception as e2:
